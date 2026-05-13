@@ -242,6 +242,78 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule Operations do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @five_gibibytes 5 * 1024 * 1024 * 1024
+
+    @primary_key false
+    embedded_schema do
+      field(:disk_path, :string)
+      field(:disk_pause_threshold_bytes, :integer, default: @five_gibibytes)
+      field(:disk_check_interval_ms, :integer, default: 60_000)
+      field(:paused_retry_interval_ms, :integer, default: 60_000)
+      field(:cleanup_dry_run_command, :string)
+      field(:cleanup_command, :string)
+      field(:cleanup_timeout_ms, :integer, default: 900_000)
+      field(:cleanup_cooldown_ms, :integer, default: 1_800_000)
+      field(:paused_issue_state, :string)
+      field(:stale_worktree_ttl_hours, :integer, default: 168)
+      field(:stale_worktree_check_interval_ms, :integer, default: 3_600_000)
+      field(:stale_worktree_delete, :boolean, default: false)
+      field(:watchdog_issue_enabled, :boolean, default: false)
+      field(:watchdog_issue_interval_ms, :integer, default: 3_600_000)
+      field(:watchdog_issue_title, :string, default: "Monitor Watchdog: hourly simulator health check")
+      field(:watchdog_issue_description, :string)
+      field(:watchdog_issue_state, :string, default: "Todo")
+      field(:watchdog_issue_assignee_id, :string)
+      field(:watchdog_issue_priority, :integer, default: 3)
+      field(:watchdog_issue_labels, {:array, :string}, default: ["Chore", "Observation"])
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(
+        attrs,
+        [
+          :disk_path,
+          :disk_pause_threshold_bytes,
+          :disk_check_interval_ms,
+          :paused_retry_interval_ms,
+          :cleanup_dry_run_command,
+          :cleanup_command,
+          :cleanup_timeout_ms,
+          :cleanup_cooldown_ms,
+          :paused_issue_state,
+          :stale_worktree_ttl_hours,
+          :stale_worktree_check_interval_ms,
+          :stale_worktree_delete,
+          :watchdog_issue_enabled,
+          :watchdog_issue_interval_ms,
+          :watchdog_issue_title,
+          :watchdog_issue_description,
+          :watchdog_issue_state,
+          :watchdog_issue_assignee_id,
+          :watchdog_issue_priority,
+          :watchdog_issue_labels
+        ],
+        empty_values: []
+      )
+      |> validate_number(:disk_pause_threshold_bytes, greater_than: 0)
+      |> validate_number(:disk_check_interval_ms, greater_than: 0)
+      |> validate_number(:paused_retry_interval_ms, greater_than: 0)
+      |> validate_number(:cleanup_timeout_ms, greater_than: 0)
+      |> validate_number(:cleanup_cooldown_ms, greater_than_or_equal_to: 0)
+      |> validate_number(:stale_worktree_ttl_hours, greater_than_or_equal_to: 0)
+      |> validate_number(:stale_worktree_check_interval_ms, greater_than: 0)
+      |> validate_number(:watchdog_issue_interval_ms, greater_than: 0)
+      |> validate_number(:watchdog_issue_priority, greater_than_or_equal_to: 0, less_than_or_equal_to: 4)
+    end
+  end
+
   defmodule Server do
     @moduledoc false
     use Ecto.Schema
@@ -270,6 +342,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:codex, Codex, on_replace: :update, defaults_to_struct: true)
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:operations, Operations, on_replace: :update, defaults_to_struct: true)
     embeds_one(:server, Server, on_replace: :update, defaults_to_struct: true)
   end
 
@@ -362,6 +435,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:codex, with: &Codex.changeset/2)
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
+    |> cast_embed(:operations, with: &Operations.changeset/2)
     |> cast_embed(:server, with: &Server.changeset/2)
   end
 
@@ -383,7 +457,12 @@ defmodule SymphonyElixir.Config.Schema do
         turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy)
     }
 
-    %{settings | tracker: tracker, workspace: workspace, codex: codex}
+    operations = %{
+      settings.operations
+      | disk_path: resolve_path_value(settings.operations.disk_path, workspace.root)
+    }
+
+    %{settings | tracker: tracker, workspace: workspace, codex: codex, operations: operations}
   end
 
   defp normalize_keys(value) when is_map(value) do
@@ -434,6 +513,8 @@ defmodule SymphonyElixir.Config.Schema do
         path
     end
   end
+
+  defp resolve_path_value(_value, default), do: default
 
   defp resolve_env_value(value, fallback) when is_binary(value) do
     case env_reference_name(value) do

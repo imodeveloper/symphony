@@ -340,7 +340,12 @@ defmodule SymphonyElixir.ExtensionsTest do
     conn = get(build_conn(), "/api/v1/state")
     state_payload = json_response(conn, 200)
 
-    assert state_payload == %{
+    assert %{"disk" => %{"status" => _status}, "dispatch" => %{"paused?" => _paused}} =
+             state_payload["operations"]
+
+    state_payload_without_operations = Map.delete(state_payload, "operations")
+
+    assert state_payload_without_operations == %{
              "generated_at" => state_payload["generated_at"],
              "counts" => %{"running" => 1, "retrying" => 1},
              "running" => [
@@ -448,7 +453,9 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     state_payload = json_response(get(build_conn(), "/api/v1/state"), 200)
 
-    assert state_payload ==
+    assert is_map(state_payload["operations"])
+
+    assert Map.delete(state_payload, "operations") ==
              %{
                "generated_at" => state_payload["generated_at"],
                "error" => %{"code" => "snapshot_unavailable", "message" => "Snapshot unavailable"}
@@ -470,7 +477,9 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     timeout_payload = json_response(get(build_conn(), "/api/v1/state"), 200)
 
-    assert timeout_payload ==
+    assert is_map(timeout_payload["operations"])
+
+    assert Map.delete(timeout_payload, "operations") ==
              %{
                "generated_at" => timeout_payload["generated_at"],
                "error" => %{"code" => "snapshot_timeout", "message" => "Snapshot timed out"}
@@ -544,8 +553,8 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "MT-RETRY"
     assert html =~ "rendered"
     assert html =~ "Runtime"
-    assert html =~ "Live"
-    assert html =~ "Offline"
+    assert html =~ "Live updates"
+    assert html =~ "Backend online"
     assert html =~ "Copy ID"
     assert html =~ "Codex update"
     refute html =~ "data-runtime-clock="

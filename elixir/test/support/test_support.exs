@@ -122,6 +122,26 @@ defmodule SymphonyElixir.TestSupport do
           observability_enabled: true,
           observability_refresh_ms: 1_000,
           observability_render_interval_ms: 16,
+          operations_disk_path: nil,
+          operations_disk_pause_threshold_bytes: 5 * 1024 * 1024 * 1024,
+          operations_disk_check_interval_ms: 60_000,
+          operations_paused_retry_interval_ms: 60_000,
+          operations_cleanup_dry_run_command: nil,
+          operations_cleanup_command: nil,
+          operations_cleanup_timeout_ms: 900_000,
+          operations_cleanup_cooldown_ms: 1_800_000,
+          operations_paused_issue_state: nil,
+          operations_stale_worktree_ttl_hours: 168,
+          operations_stale_worktree_check_interval_ms: 3_600_000,
+          operations_stale_worktree_delete: false,
+          operations_watchdog_issue_enabled: false,
+          operations_watchdog_issue_interval_ms: 3_600_000,
+          operations_watchdog_issue_title: "Monitor Watchdog: hourly simulator health check",
+          operations_watchdog_issue_description: nil,
+          operations_watchdog_issue_state: "Todo",
+          operations_watchdog_issue_assignee_id: nil,
+          operations_watchdog_issue_priority: 3,
+          operations_watchdog_issue_labels: ["Chore", "Observation"],
           server_port: nil,
           server_host: nil,
           prompt: @workflow_prompt
@@ -159,9 +179,44 @@ defmodule SymphonyElixir.TestSupport do
     observability_enabled = Keyword.get(config, :observability_enabled)
     observability_refresh_ms = Keyword.get(config, :observability_refresh_ms)
     observability_render_interval_ms = Keyword.get(config, :observability_render_interval_ms)
+    operations_disk_path = Keyword.get(config, :operations_disk_path)
+    operations_disk_pause_threshold_bytes = Keyword.get(config, :operations_disk_pause_threshold_bytes)
+    operations_disk_check_interval_ms = Keyword.get(config, :operations_disk_check_interval_ms)
+    operations_paused_retry_interval_ms = Keyword.get(config, :operations_paused_retry_interval_ms)
+    operations_cleanup_dry_run_command = Keyword.get(config, :operations_cleanup_dry_run_command)
+    operations_cleanup_command = Keyword.get(config, :operations_cleanup_command)
+    operations_cleanup_timeout_ms = Keyword.get(config, :operations_cleanup_timeout_ms)
+    operations_cleanup_cooldown_ms = Keyword.get(config, :operations_cleanup_cooldown_ms)
+    operations_paused_issue_state = Keyword.get(config, :operations_paused_issue_state)
+    operations_stale_worktree_ttl_hours = Keyword.get(config, :operations_stale_worktree_ttl_hours)
+    operations_stale_worktree_check_interval_ms = Keyword.get(config, :operations_stale_worktree_check_interval_ms)
+    operations_stale_worktree_delete = Keyword.get(config, :operations_stale_worktree_delete)
     server_port = Keyword.get(config, :server_port)
     server_host = Keyword.get(config, :server_host)
     prompt = Keyword.get(config, :prompt)
+
+    operations_config = %{
+      disk_path: operations_disk_path,
+      disk_pause_threshold_bytes: operations_disk_pause_threshold_bytes,
+      disk_check_interval_ms: operations_disk_check_interval_ms,
+      paused_retry_interval_ms: operations_paused_retry_interval_ms,
+      cleanup_dry_run_command: operations_cleanup_dry_run_command,
+      cleanup_command: operations_cleanup_command,
+      cleanup_timeout_ms: operations_cleanup_timeout_ms,
+      cleanup_cooldown_ms: operations_cleanup_cooldown_ms,
+      paused_issue_state: operations_paused_issue_state,
+      stale_worktree_ttl_hours: operations_stale_worktree_ttl_hours,
+      stale_worktree_check_interval_ms: operations_stale_worktree_check_interval_ms,
+      stale_worktree_delete: operations_stale_worktree_delete,
+      watchdog_issue_enabled: Keyword.get(config, :operations_watchdog_issue_enabled),
+      watchdog_issue_interval_ms: Keyword.get(config, :operations_watchdog_issue_interval_ms),
+      watchdog_issue_title: Keyword.get(config, :operations_watchdog_issue_title),
+      watchdog_issue_description: Keyword.get(config, :operations_watchdog_issue_description),
+      watchdog_issue_state: Keyword.get(config, :operations_watchdog_issue_state),
+      watchdog_issue_assignee_id: Keyword.get(config, :operations_watchdog_issue_assignee_id),
+      watchdog_issue_priority: Keyword.get(config, :operations_watchdog_issue_priority),
+      watchdog_issue_labels: Keyword.get(config, :operations_watchdog_issue_labels)
+    }
 
     sections =
       [
@@ -194,6 +249,7 @@ defmodule SymphonyElixir.TestSupport do
         "  stall_timeout_ms: #{yaml_value(codex_stall_timeout_ms)}",
         hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
         observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),
+        operations_yaml(operations_config),
         server_yaml(server_port, server_host),
         "---",
         prompt
@@ -262,6 +318,37 @@ defmodule SymphonyElixir.TestSupport do
       "  refresh_ms: #{yaml_value(refresh_ms)}",
       "  render_interval_ms: #{yaml_value(render_interval_ms)}"
     ]
+    |> Enum.join("\n")
+  end
+
+  defp operations_yaml(config) do
+    [
+      "operations:",
+      config.disk_path && "  disk_path: #{yaml_value(config.disk_path)}",
+      "  disk_pause_threshold_bytes: #{yaml_value(config.disk_pause_threshold_bytes)}",
+      "  disk_check_interval_ms: #{yaml_value(config.disk_check_interval_ms)}",
+      "  paused_retry_interval_ms: #{yaml_value(config.paused_retry_interval_ms)}",
+      config.cleanup_dry_run_command &&
+        "  cleanup_dry_run_command: #{yaml_value(config.cleanup_dry_run_command)}",
+      config.cleanup_command && "  cleanup_command: #{yaml_value(config.cleanup_command)}",
+      "  cleanup_timeout_ms: #{yaml_value(config.cleanup_timeout_ms)}",
+      "  cleanup_cooldown_ms: #{yaml_value(config.cleanup_cooldown_ms)}",
+      config.paused_issue_state && "  paused_issue_state: #{yaml_value(config.paused_issue_state)}",
+      "  stale_worktree_ttl_hours: #{yaml_value(config.stale_worktree_ttl_hours)}",
+      "  stale_worktree_check_interval_ms: #{yaml_value(config.stale_worktree_check_interval_ms)}",
+      "  stale_worktree_delete: #{yaml_value(config.stale_worktree_delete)}",
+      "  watchdog_issue_enabled: #{yaml_value(config.watchdog_issue_enabled)}",
+      "  watchdog_issue_interval_ms: #{yaml_value(config.watchdog_issue_interval_ms)}",
+      "  watchdog_issue_title: #{yaml_value(config.watchdog_issue_title)}",
+      config.watchdog_issue_description &&
+        "  watchdog_issue_description: #{yaml_value(config.watchdog_issue_description)}",
+      "  watchdog_issue_state: #{yaml_value(config.watchdog_issue_state)}",
+      config.watchdog_issue_assignee_id &&
+        "  watchdog_issue_assignee_id: #{yaml_value(config.watchdog_issue_assignee_id)}",
+      "  watchdog_issue_priority: #{yaml_value(config.watchdog_issue_priority)}",
+      "  watchdog_issue_labels: #{yaml_value(config.watchdog_issue_labels)}"
+    ]
+    |> Enum.reject(&(&1 in [nil, false]))
     |> Enum.join("\n")
   end
 

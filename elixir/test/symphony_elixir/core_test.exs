@@ -17,6 +17,10 @@ defmodule SymphonyElixir.CoreTest do
     assert config.tracker.terminal_states == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
     assert config.tracker.assignee == nil
     assert config.agent.max_turns == 20
+    assert config.operations.disk_pause_threshold_bytes == 5 * 1024 * 1024 * 1024
+    assert config.operations.stale_worktree_delete == false
+    assert config.operations.watchdog_issue_enabled == false
+    assert config.operations.watchdog_issue_interval_ms == 3_600_000
 
     write_workflow_file!(Workflow.workflow_file_path(), poll_interval_ms: "invalid")
 
@@ -88,6 +92,46 @@ defmodule SymphonyElixir.CoreTest do
     assert {:error, {:unsupported_tracker_kind, "123"}} = Config.validate!()
   end
 
+  test "operations config validates disk and cleanup settings" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      operations_disk_path: "/tmp/symphony-disk",
+      operations_disk_pause_threshold_bytes: 1024,
+      operations_disk_check_interval_ms: 2_000,
+      operations_paused_retry_interval_ms: 3_000,
+      operations_cleanup_command: "echo cleanup",
+      operations_cleanup_timeout_ms: 10_000,
+      operations_cleanup_cooldown_ms: 0,
+      operations_paused_issue_state: "Rework",
+      operations_stale_worktree_ttl_hours: 24,
+      operations_stale_worktree_check_interval_ms: 60_000,
+      operations_stale_worktree_delete: true,
+      operations_watchdog_issue_enabled: true,
+      operations_watchdog_issue_interval_ms: 3_600_000,
+      operations_watchdog_issue_title: "Monitor Watchdog",
+      operations_watchdog_issue_state: "Todo",
+      operations_watchdog_issue_assignee_id: "user-1",
+      operations_watchdog_issue_priority: 3,
+      operations_watchdog_issue_labels: ["Chore", "Observation"]
+    )
+
+    config = Config.settings!()
+    assert config.operations.disk_path == "/tmp/symphony-disk"
+    assert config.operations.disk_pause_threshold_bytes == 1024
+    assert config.operations.paused_retry_interval_ms == 3_000
+    assert config.operations.cleanup_command == "echo cleanup"
+    assert config.operations.cleanup_cooldown_ms == 0
+    assert config.operations.paused_issue_state == "Rework"
+    assert config.operations.stale_worktree_delete == true
+    assert config.operations.watchdog_issue_enabled == true
+    assert config.operations.watchdog_issue_title == "Monitor Watchdog"
+    assert config.operations.watchdog_issue_assignee_id == "user-1"
+    assert config.operations.watchdog_issue_labels == ["Chore", "Observation"]
+
+    write_workflow_file!(Workflow.workflow_file_path(), operations_disk_pause_threshold_bytes: 0)
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "operations.disk_pause_threshold_bytes"
+  end
+
   test "current WORKFLOW.md file is valid and complete" do
     original_workflow_path = Workflow.workflow_file_path()
     on_exit(fn -> Workflow.set_workflow_file_path(original_workflow_path) end)
@@ -105,10 +149,9 @@ defmodule SymphonyElixir.CoreTest do
 
     hooks = Map.get(config, "hooks", %{})
     assert is_map(hooks)
-    assert Map.get(hooks, "after_create") =~ "git clone --depth 1 https://github.com/openai/symphony ."
-    assert Map.get(hooks, "after_create") =~ "cd elixir && mise trust"
-    assert Map.get(hooks, "after_create") =~ "mise exec -- mix deps.get"
-    assert Map.get(hooks, "before_remove") =~ "cd elixir && mise exec -- mix workspace.before_remove"
+    assert Map.get(hooks, "after_create") =~ "git clone --depth 1 https://github.com/imodeveloper/imodeveloperlab ."
+    assert Map.get(hooks, "after_create") =~ "mise trust || true"
+    assert Map.get(hooks, "before_remove") =~ "true"
 
     assert String.trim(prompt) != ""
     assert is_binary(Config.workflow_prompt())
@@ -543,6 +586,7 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    before_schedule_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :normal})
     Process.sleep(50)
     state = :sys.get_state(pid)
@@ -551,7 +595,7 @@ defmodule SymphonyElixir.CoreTest do
     assert MapSet.member?(state.completed, issue_id)
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 500, 1_100)
+    assert_due_in_range(due_at_ms, before_schedule_ms, 500, 1_100)
   end
 
   test "abnormal worker exit increments retry attempt progressively" do
@@ -584,6 +628,7 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    before_schedule_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :boom})
     Process.sleep(50)
     state = :sys.get_state(pid)
@@ -591,7 +636,7 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 39_500, 40_500)
+    assert_due_in_range(due_at_ms, before_schedule_ms, 39_500, 40_500)
   end
 
   test "first abnormal worker exit waits before retrying" do
@@ -623,6 +668,7 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    before_schedule_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :boom})
     Process.sleep(50)
     state = :sys.get_state(pid)
@@ -630,7 +676,7 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-560", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 9_000, 10_500)
+    assert_due_in_range(due_at_ms, before_schedule_ms, 9_000, 10_500)
   end
 
   test "stale retry timer messages do not consume newer retry entries" do
@@ -750,11 +796,11 @@ defmodule SymphonyElixir.CoreTest do
     assert Orchestrator.select_worker_host_for_test(state, "worker-a") == "worker-a"
   end
 
-  defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms) do
-    remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
+  defp assert_due_in_range(due_at_ms, before_schedule_ms, min_delay_ms, max_delay_ms) do
+    elapsed_until_due_ms = due_at_ms - before_schedule_ms
 
-    assert remaining_ms >= min_remaining_ms
-    assert remaining_ms <= max_remaining_ms
+    assert elapsed_until_due_ms >= min_delay_ms
+    assert elapsed_until_due_ms <= max_delay_ms
   end
 
   defp restore_app_env(key, nil), do: Application.delete_env(:symphony_elixir, key)

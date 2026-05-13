@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, Operations, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -224,51 +224,58 @@ defmodule SymphonyElixir.Orchestrator do
   defp maybe_dispatch(%State{} = state) do
     state = reconcile_running_issues(state)
 
-    with :ok <- Config.validate!(),
-         {:ok, issues} <- Tracker.fetch_candidate_issues(),
-         true <- available_slots(state) > 0 do
-      choose_issues(issues, state)
-    else
-      {:error, :missing_linear_api_token} ->
-        Logger.error("Linear API token missing in WORKFLOW.md")
-        state
+    case operations_dispatch_pause() do
+      %{paused?: true} = pause ->
+        Logger.warning("Orchestrator dispatch paused by operations guardrail: #{pause.reason || "unknown"}")
+        pause_running_for_operations(state, pause)
 
-      {:error, :missing_linear_project_slug} ->
-        Logger.error("Linear project slug missing in WORKFLOW.md")
-        state
+      _ ->
+        with :ok <- Config.validate!(),
+             {:ok, issues} <- Tracker.fetch_candidate_issues(),
+             true <- available_slots(state) > 0 do
+          choose_issues(issues, state)
+        else
+          {:error, :missing_linear_api_token} ->
+            Logger.error("Linear API token missing in WORKFLOW.md")
+            state
 
-      {:error, :missing_tracker_kind} ->
-        Logger.error("Tracker kind missing in WORKFLOW.md")
+          {:error, :missing_linear_project_slug} ->
+            Logger.error("Linear project slug missing in WORKFLOW.md")
+            state
 
-        state
+          {:error, :missing_tracker_kind} ->
+            Logger.error("Tracker kind missing in WORKFLOW.md")
 
-      {:error, {:unsupported_tracker_kind, kind}} ->
-        Logger.error("Unsupported tracker kind in WORKFLOW.md: #{inspect(kind)}")
+            state
 
-        state
+          {:error, {:unsupported_tracker_kind, kind}} ->
+            Logger.error("Unsupported tracker kind in WORKFLOW.md: #{inspect(kind)}")
 
-      {:error, {:invalid_workflow_config, message}} ->
-        Logger.error("Invalid WORKFLOW.md config: #{message}")
-        state
+            state
 
-      {:error, {:missing_workflow_file, path, reason}} ->
-        Logger.error("Missing WORKFLOW.md at #{path}: #{inspect(reason)}")
-        state
+          {:error, {:invalid_workflow_config, message}} ->
+            Logger.error("Invalid WORKFLOW.md config: #{message}")
+            state
 
-      {:error, :workflow_front_matter_not_a_map} ->
-        Logger.error("Failed to parse WORKFLOW.md: workflow front matter must decode to a map")
-        state
+          {:error, {:missing_workflow_file, path, reason}} ->
+            Logger.error("Missing WORKFLOW.md at #{path}: #{inspect(reason)}")
+            state
 
-      {:error, {:workflow_parse_error, reason}} ->
-        Logger.error("Failed to parse WORKFLOW.md: #{inspect(reason)}")
-        state
+          {:error, :workflow_front_matter_not_a_map} ->
+            Logger.error("Failed to parse WORKFLOW.md: workflow front matter must decode to a map")
+            state
 
-      {:error, reason} ->
-        Logger.error("Failed to fetch from Linear: #{inspect(reason)}")
-        state
+          {:error, {:workflow_parse_error, reason}} ->
+            Logger.error("Failed to parse WORKFLOW.md: #{inspect(reason)}")
+            state
 
-      false ->
-        state
+          {:error, reason} ->
+            Logger.error("Failed to fetch from Linear: #{inspect(reason)}")
+            state
+
+          false ->
+            state
+        end
     end
   end
 
@@ -827,6 +834,16 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_retry_issue(%State{} = state, issue_id, attempt, metadata) do
+    case operations_dispatch_pause() do
+      %{paused?: true} = pause ->
+        handle_operations_paused_retry(state, issue_id, attempt, metadata, pause)
+
+      _ ->
+        handle_retry_issue_when_not_paused(state, issue_id, attempt, metadata)
+    end
+  end
+
+  defp handle_retry_issue_when_not_paused(%State{} = state, issue_id, attempt, metadata) do
     case Tracker.fetch_candidate_issues() do
       {:ok, issues} ->
         issues
@@ -842,6 +859,55 @@ defmodule SymphonyElixir.Orchestrator do
            issue_id,
            attempt + 1,
            Map.merge(metadata, %{error: "retry poll failed: #{inspect(reason)}"})
+         )}
+    end
+  end
+
+  defp handle_operations_paused_retry(%State{} = state, issue_id, attempt, metadata, pause) do
+    if pause.unresolved_after_cleanup? and is_binary(pause.paused_issue_state) do
+      move_paused_issue_to_state(state, issue_id, attempt, metadata, pause)
+    else
+      {:noreply,
+       schedule_issue_retry(
+         state,
+         issue_id,
+         attempt,
+         Map.merge(metadata, %{
+           error: "paused by operations guardrail: #{pause.reason || "unknown"}",
+           delay_type: :operations_pause
+         })
+       )}
+    end
+  end
+
+  defp move_paused_issue_to_state(%State{} = state, issue_id, attempt, metadata, pause) do
+    target_state = pause.paused_issue_state
+    identifier = metadata[:identifier] || issue_id
+
+    comment_body =
+      "## Symphony Operations Guardrail\n\n" <>
+        "This issue was paused because #{pause.reason || "the operations guardrail is active"}.\n\n" <>
+        "Safe cleanup already completed, but the runtime is still paused, so Symphony moved the issue to `#{target_state}` for visible triage. It will be eligible again when disk pressure clears."
+
+    _ = Tracker.create_comment(issue_id, comment_body)
+
+    case Tracker.update_issue_state(issue_id, target_state) do
+      :ok ->
+        Logger.warning("Moved paused issue to #{target_state}: issue_id=#{issue_id} issue_identifier=#{identifier}")
+        {:noreply, release_issue_claim(state, issue_id)}
+
+      {:error, reason} ->
+        Logger.warning("Failed moving paused issue to #{target_state}: issue_id=#{issue_id} issue_identifier=#{identifier} reason=#{inspect(reason)}")
+
+        {:noreply,
+         schedule_issue_retry(
+           state,
+           issue_id,
+           attempt,
+           Map.merge(metadata, %{
+             error: "paused by operations guardrail; failed to move to #{target_state}: #{inspect(reason)}",
+             delay_type: :operations_pause
+           })
          )}
     end
   end
@@ -900,6 +966,57 @@ defmodule SymphonyElixir.Orchestrator do
     StatusDashboard.notify_update()
   end
 
+  defp operations_dispatch_pause do
+    Operations.dispatch_pause()
+  rescue
+    error in [ArgumentError, RuntimeError] ->
+      %{
+        paused?: true,
+        reason: "operations guardrail unavailable: #{Exception.message(error)}",
+        paused_issue_state: nil,
+        unresolved_after_cleanup?: false
+      }
+  catch
+    :exit, _reason ->
+      %{paused?: false, reason: nil, paused_issue_state: nil, unresolved_after_cleanup?: false}
+  end
+
+  defp pause_running_for_operations(%State{running: running} = state, pause) when map_size(running) == 0 do
+    put_operation_pause_retry_errors(state, pause)
+  end
+
+  defp pause_running_for_operations(%State{running: running} = state, pause) do
+    running
+    |> Enum.reduce(state, fn {issue_id, running_entry}, state_acc ->
+      identifier = Map.get(running_entry, :identifier, issue_id)
+      session_id = running_entry_session_id(running_entry)
+
+      Logger.warning("Pausing active issue for operations guardrail: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} reason=#{pause.reason || "unknown"}")
+
+      next_attempt = next_retry_attempt_from_running(running_entry)
+
+      state_acc
+      |> terminate_running_issue(issue_id, false)
+      |> schedule_issue_retry(issue_id, next_attempt, %{
+        identifier: identifier,
+        error: "paused by operations guardrail: #{pause.reason || "unknown"}",
+        worker_host: Map.get(running_entry, :worker_host),
+        workspace_path: Map.get(running_entry, :workspace_path),
+        delay_type: :operations_pause
+      })
+    end)
+    |> put_operation_pause_retry_errors(pause)
+  end
+
+  defp put_operation_pause_retry_errors(%State{retry_attempts: retry_attempts} = state, pause) do
+    retry_attempts =
+      Enum.reduce(retry_attempts, retry_attempts, fn {issue_id, retry}, acc ->
+        Map.put(acc, issue_id, Map.put(retry, :error, "paused by operations guardrail: #{pause.reason || "unknown"}"))
+      end)
+
+    %{state | retry_attempts: retry_attempts}
+  end
+
   defp handle_active_retry(state, issue, attempt, metadata) do
     if retry_candidate_issue?(issue, terminal_state_set()) and
          dispatch_slots_available?(issue, state) and
@@ -926,10 +1043,15 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
-    if metadata[:delay_type] == :continuation and attempt == 1 do
-      @continuation_retry_delay_ms
-    else
-      failure_retry_delay(attempt)
+    cond do
+      metadata[:delay_type] == :continuation and attempt == 1 ->
+        @continuation_retry_delay_ms
+
+      metadata[:delay_type] == :operations_pause ->
+        Config.settings!().operations.paused_retry_interval_ms
+
+      true ->
+        failure_retry_delay(attempt)
     end
   end
 

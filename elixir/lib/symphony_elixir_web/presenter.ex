@@ -3,7 +3,7 @@ defmodule SymphonyElixirWeb.Presenter do
   Shared projections for the observability API and dashboard.
   """
 
-  alias SymphonyElixir.{Config, Orchestrator, StatusDashboard}
+  alias SymphonyElixir.{Config, Operations, Orchestrator, StatusDashboard}
 
   @spec state_payload(GenServer.name(), timeout()) :: map()
   def state_payload(orchestrator, snapshot_timeout_ms) do
@@ -20,14 +20,23 @@ defmodule SymphonyElixirWeb.Presenter do
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           codex_totals: snapshot.codex_totals,
-          rate_limits: snapshot.rate_limits
+          rate_limits: snapshot.rate_limits,
+          operations: Operations.snapshot()
         }
 
       :timeout ->
-        %{generated_at: generated_at, error: %{code: "snapshot_timeout", message: "Snapshot timed out"}}
+        %{
+          generated_at: generated_at,
+          operations: Operations.snapshot(),
+          error: %{code: "snapshot_timeout", message: "Snapshot timed out"}
+        }
 
       :unavailable ->
-        %{generated_at: generated_at, error: %{code: "snapshot_unavailable", message: "Snapshot unavailable"}}
+        %{
+          generated_at: generated_at,
+          operations: Operations.snapshot(),
+          error: %{code: "snapshot_unavailable", message: "Snapshot unavailable"}
+        }
     end
   end
 

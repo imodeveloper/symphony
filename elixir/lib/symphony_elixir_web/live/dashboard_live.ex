@@ -58,11 +58,11 @@ defmodule SymphonyElixirWeb.DashboardLive do
           <div class="status-stack">
             <span class="status-badge status-badge-live">
               <span class="status-badge-dot"></span>
-              Live
+              Live updates
             </span>
             <span class="status-badge status-badge-offline">
               <span class="status-badge-dot"></span>
-              Offline
+              Backend online
             </span>
           </div>
         </div>
@@ -104,6 +104,69 @@ defmodule SymphonyElixirWeb.DashboardLive do
             <p class="metric-value numeric"><%= format_runtime_seconds(total_runtime_seconds(@payload, @now)) %></p>
             <p class="metric-detail">Total Codex runtime across completed and active sessions.</p>
           </article>
+
+          <article class="metric-card">
+            <p class="metric-label">Disk free</p>
+            <p class="metric-value numeric"><%= format_bytes(operation_value(@payload, [:disk, :available_bytes])) %></p>
+            <p class="metric-detail"><%= disk_metric_detail(@payload) %></p>
+          </article>
+
+          <article class="metric-card">
+            <p class="metric-label">Guardrail</p>
+            <p class="metric-value"><%= guardrail_label(@payload) %></p>
+            <p class="metric-detail"><%= guardrail_detail(@payload) %></p>
+          </article>
+        </section>
+
+        <section class="section-card">
+          <div class="section-header">
+            <div>
+              <h2 class="section-title">Operations</h2>
+              <p class="section-copy">Runtime heartbeat, disk pressure guardrail, cleanup, and stale worktree cleanup.</p>
+            </div>
+          </div>
+
+          <div class="operation-grid">
+            <div class="operation-item">
+              <span class="operation-label">Heartbeat</span>
+              <span class="operation-value mono"><%= operation_value(@payload, [:heartbeat_at]) || "n/a" %></span>
+            </div>
+            <div class="operation-item">
+              <span class="operation-label">Disk status</span>
+              <span class={operation_badge_class(operation_value(@payload, [:disk, :status]))}>
+                <%= operation_value(@payload, [:disk, :status]) || "unknown" %>
+              </span>
+            </div>
+            <div class="operation-item">
+              <span class="operation-label">Disk path</span>
+              <span class="operation-value mono"><%= operation_value(@payload, [:disk, :path]) || "n/a" %></span>
+            </div>
+            <div class="operation-item">
+              <span class="operation-label">Threshold</span>
+              <span class="operation-value numeric"><%= format_bytes(operation_value(@payload, [:disk, :threshold_bytes])) %></span>
+            </div>
+            <div class="operation-item">
+              <span class="operation-label">Cleanup</span>
+              <span class={operation_badge_class(operation_value(@payload, [:cleanup, :status]))}>
+                <%= operation_value(@payload, [:cleanup, :status]) || "unknown" %>
+              </span>
+            </div>
+            <div class="operation-item">
+              <span class="operation-label">Stale worktrees</span>
+              <span class="operation-value numeric">
+                <%= stale_worktree_summary(@payload) %>
+              </span>
+            </div>
+            <div class="operation-item">
+              <span class="operation-label">Linear watchdog</span>
+              <span class={operation_badge_class(operation_value(@payload, [:linear_watchdog, :status]))}>
+                <%= operation_value(@payload, [:linear_watchdog, :status]) || "unknown" %>
+              </span>
+              <span class="operation-value">
+                <%= linear_watchdog_summary(@payload) %>
+              </span>
+            </div>
+          </div>
         </section>
 
         <section class="section-card">
@@ -308,6 +371,76 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   defp format_int(_value), do: "n/a"
+
+  defp operation_value(payload, path) when is_map(payload) and is_list(path) do
+    get_in(payload, [:operations | path])
+  end
+
+  defp operation_value(_payload, _path), do: nil
+
+  defp format_bytes(bytes) when is_integer(bytes) and bytes >= 0 do
+    cond do
+      bytes >= 1024 * 1024 * 1024 ->
+        "#{Float.round(bytes / 1024 / 1024 / 1024, 1)} GiB"
+
+      bytes >= 1024 * 1024 ->
+        "#{Float.round(bytes / 1024 / 1024, 1)} MiB"
+
+      true ->
+        "#{bytes} B"
+    end
+  end
+
+  defp format_bytes(_bytes), do: "n/a"
+
+  defp disk_metric_detail(payload) do
+    total = format_bytes(operation_value(payload, [:disk, :total_bytes]))
+    checked_at = operation_value(payload, [:disk, :checked_at]) || "not checked"
+
+    case operation_value(payload, [:disk, :used_percent]) do
+      percent when is_integer(percent) -> "#{percent}% used of #{total}; checked #{checked_at}"
+      _ -> "Checked #{checked_at}"
+    end
+  end
+
+  defp guardrail_label(payload) do
+    if operation_value(payload, [:dispatch, :paused?]) == true do
+      "Paused"
+    else
+      "Ready"
+    end
+  end
+
+  defp guardrail_detail(payload) do
+    operation_value(payload, [:dispatch, :reason]) || "Dispatch is allowed."
+  end
+
+  defp stale_worktree_summary(payload) do
+    status = operation_value(payload, [:stale_worktrees, :status]) || "unknown"
+    scanned = operation_value(payload, [:stale_worktrees, :scanned]) || 0
+    deleted = operation_value(payload, [:stale_worktrees, :deleted]) || []
+
+    "#{status}; #{length(deleted)} deleted / #{scanned} scanned"
+  end
+
+  defp linear_watchdog_summary(payload) do
+    identifier = operation_value(payload, [:linear_watchdog, :issue_identifier]) || "not created"
+    action = operation_value(payload, [:linear_watchdog, :action]) || "idle"
+
+    "#{identifier}; #{action}"
+  end
+
+  defp operation_badge_class(status) do
+    base = "state-badge"
+    normalized = status |> to_string() |> String.downcase()
+
+    cond do
+      normalized in ["healthy", "completed", "idle", "checked", "ready"] -> "#{base} state-badge-active"
+      normalized in ["low", "running", "disabled", "missing_root"] -> "#{base} state-badge-warning"
+      normalized in ["error", "failed"] -> "#{base} state-badge-danger"
+      true -> base
+    end
+  end
 
   defp state_badge_class(state) do
     base = "state-badge"

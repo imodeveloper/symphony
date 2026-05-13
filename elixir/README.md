@@ -40,7 +40,7 @@ Symphony stops the active agent for that issue and cleans up matching workspaces
    - To get your project's slug, right-click the project and copy its URL. The slug is part of the
      URL.
    - When creating a workflow based on this repo, note that it depends on non-standard Linear
-     issue statuses: "Rework", "Human Review", and "Merging". You can customize them in
+     issue statuses: "Rework", "Codex Review", and "Merging". You can customize them in
      Team Settings → Workflow in Linear.
 6. Follow the instructions below to install the required runtime dependencies and start the service.
 
@@ -63,6 +63,27 @@ mise install
 mise exec -- mix setup
 mise exec -- mix build
 mise exec -- ./bin/symphony ./WORKFLOW.md
+```
+
+## Local CodexOrchestrator Deployment
+
+This checkout is installed in place as the local CodexOrchestrator service. The local workflow uses
+Linear, creates workspaces under `/Users/ivan.borinschi/Work/Worktrees/symphony`, and bootstraps
+each issue workspace from `https://github.com/imodeveloper/imodeveloperlab`.
+
+The launchd wrapper loads `LINEAR_API_KEY` from the macOS Keychain item
+`service=codex-orchestrator-linear`, `account=LINEAR_API_KEY`; the key is not stored in
+`WORKFLOW.md`, launchd plist files, or repository files.
+
+The launchd wrapper runs:
+
+```bash
+cd /Users/ivan.borinschi/Work/CodexOrchestrator/elixir
+mise exec -- ./bin/symphony \
+  --i-understand-that-this-will-be-running-without-the-usual-guardrails \
+  --logs-root ../data/logs \
+  --port 4174 \
+  ./WORKFLOW.md
 ```
 
 ## Configuration
@@ -121,6 +142,33 @@ Notes:
   Symphony validation.
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
+- This local deployment intentionally sets Codex to `danger-full-access` / `dangerFullAccess`
+  because Monitor tickets need host access to Xcode, CoreSimulator, simulator logs, and git metadata
+  inside issue worktrees. Per-issue work remains separated by the configured workspace root and clone
+  hook; this setting is for this Mac-hosted orchestrator, not a general default.
+- Local Linear issue classification uses the labels `Bug`, `Improvement`, `Feature`, `Chore`,
+  `Observation`, and `Follow-up`. The workflow requires agents to apply them to the current issue and
+  to any generated follow-up issues.
+- Local Linear assignment policy uses Borinschi Ivan as the owner for current and generated issues.
+  The workflow assigns on pickup and on follow-up creation instead of filtering only assigned issues,
+  so unassigned manual tickets can still be claimed and corrected by the agent.
+- Local Linear priority policy requires agents to set priority from request impact:
+  Urgent, High, Medium, or Low. Current and generated issues should not stay at
+  `No priority` unless they are terminal and no work will run.
+- `operations.disk_path` is checked continuously. When free space drops below
+  `operations.disk_pause_threshold_bytes`, Symphony pauses dispatch, terminates active agents into
+  retry without deleting their workspaces, runs the configured safe cleanup commands, and resumes
+  retry dispatch when disk pressure clears. If cleanup has completed and the Mac is still below the
+  threshold, `operations.paused_issue_state` can move paused retry tickets to a visible state such as
+  `Rework`.
+- `operations.stale_worktree_delete` enables stale workspace pruning under `workspace.root`.
+  Symphony skips worktrees for currently active tracker issues and only deletes directories older
+  than `operations.stale_worktree_ttl_hours`.
+- `operations.watchdog_issue_enabled` lets Symphony own the hourly Monitor watchdog as a Linear
+  issue instead of a Codex automation. The local deployment keeps one issue titled
+  `Monitor Watchdog: hourly simulator health check`; when it is not already active, Symphony moves
+  that same issue back to `Todo` once per hour so the normal Linear -> Symphony -> Codex path runs
+  it.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run

@@ -1,10 +1,12 @@
 ---
 tracker:
   kind: linear
-  project_slug: "symphony-0c79b11b75ea"
+  api_key: "$LINEAR_API_KEY"
+  project_slug: "imodeveloperlab-2e208b71940c"
   active_states:
     - Todo
     - In Progress
+    - Codex Review
     - Merging
     - Rework
   terminal_states:
@@ -16,24 +18,62 @@ tracker:
 polling:
   interval_ms: 5000
 workspace:
-  root: ~/code/symphony-workspaces
+  root: /Users/ivan.borinschi/Work/Worktrees/symphony
+operations:
+  disk_path: /Users/ivan.borinschi/Work
+  disk_pause_threshold_bytes: 5368709120
+  disk_check_interval_ms: 60000
+  paused_retry_interval_ms: 60000
+  cleanup_dry_run_command: python3 /Users/ivan.borinschi/.codex/skills/simulator-storage-cleanup/scripts/cleanup_simulator_storage.py --dry-run --verbose
+  cleanup_command: python3 /Users/ivan.borinschi/.codex/skills/simulator-storage-cleanup/scripts/cleanup_simulator_storage.py --apply --all-safe
+  cleanup_timeout_ms: 900000
+  cleanup_cooldown_ms: 1800000
+  paused_issue_state: Rework
+  stale_worktree_ttl_hours: 168
+  stale_worktree_check_interval_ms: 3600000
+  stale_worktree_delete: true
+  watchdog_issue_enabled: true
+  watchdog_issue_interval_ms: 3600000
+  watchdog_issue_title: "Monitor Watchdog: hourly simulator health check"
+  watchdog_issue_state: Todo
+  watchdog_issue_assignee_id: d3ae2fb1-1804-4655-9895-bf3338c10e15
+  watchdog_issue_priority: 3
+  watchdog_issue_labels:
+    - Chore
+    - Observation
+  watchdog_issue_description: |
+    This is the Symphony-owned hourly Monitor watchdog task. Do not run this from a Codex automation.
+
+    Run exactly one watchdog cycle, update the persistent Codex Workpad comment, then move this same issue to `Done`. Symphony will move it back to `Todo` on the next hourly interval when the issue is not already active.
+
+    Required watchdog contract:
+    - First read `/Users/ivan.borinschi/Work/AGENTS.md` and `/Users/ivan.borinschi/Work/imodeveloperlab/AGENTS.md`.
+    - Keep this task narrow: do not run unrelated tests, do not modify Monitor source files, do not change signing/project settings, and do not use any simulator except `Imodeveloper Monitor Watchdog` unless you are only reporting a blocker.
+    - Check free disk space for `/Users/ivan.borinschi/Work` before heavy work. If it is below 5 GB, do not build and do not boot extra simulators; report `WATCHDOG_PAUSED_DISK_PRESSURE` with the free space.
+    - Use repo `/Users/ivan.borinschi/Work/imodeveloperlab`, watchdog worktree `/Users/ivan.borinschi/Work/Worktrees/monitor-watchdog-main`, workspace `Workspace.xcworkspace`, scheme `Monitor-Prod`, bundle id `com.monitor.md`, simulator `Imodeveloper Monitor Watchdog`, and DerivedData `/Users/ivan.borinschi/Work/Worktrees/monitor-watchdog-deriveddata`.
+    - Fetch current `origin/main`. Ensure the watchdog worktree is a clean checkout of that SHA. Rebuild/relaunch only when main changed, no successful SHA is recorded, the app is not installed, or Monitor is not running.
+    - If CoreSimulator access fails, stop before building and report `WATCHDOG_PAUSED_RUNTIME_BLOCKER` with the exact failure.
+    - If Monitor runtime errors are found, create or update exactly one Linear issue in this project for the distinct failure. Assign Borinschi Ivan, use status `Todo`, labels `Bug`, `Observation`, and `Follow-up`, and set priority based on severity.
+    - Final report must include watchdog status, simulator name/UDID, main SHA, previous successful SHA, whether build/install/relaunch happened, whether Monitor was running, whether logs looked alive, created/updated Linear issue, and blocker reason if blocked.
 hooks:
   after_create: |
-    git clone --depth 1 https://github.com/openai/symphony .
+    git clone --depth 1 https://github.com/imodeveloper/imodeveloperlab .
     if command -v mise >/dev/null 2>&1; then
-      cd elixir && mise trust && mise exec -- mix deps.get
+      mise trust || true
     fi
   before_remove: |
-    cd elixir && mise exec -- mix workspace.before_remove
+    true
 agent:
   max_concurrent_agents: 10
   max_turns: 20
+  max_concurrent_agents_by_state:
+    Merging: 1
 codex:
-  command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=xhigh app-server
+  command: codex app-server
   approval_policy: never
-  thread_sandbox: workspace-write
+  thread_sandbox: danger-full-access
   turn_sandbox_policy:
-    type: workspaceWrite
+    type: dangerFullAccess
 ---
 
 You are working on a Linear ticket `{{ issue.identifier }}`
@@ -80,15 +120,43 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 - Spend extra effort up front on planning and verification design before implementation.
 - Reproduce first: always confirm the current behavior/issue signal before changing code so the fix target is explicit.
 - Keep ticket metadata current (state, checklist, acceptance criteria, links).
+- Always use Borinschi Ivan as the Linear assignee. Before planning, state
+  changes, implementation, or validation, ensure the current issue is assigned
+  to Borinschi Ivan using Linear `assigneeId` `d3ae2fb1-1804-4655-9895-bf3338c10e15`.
+  If the issue is unassigned or assigned to someone else, update the assignee
+  first and record that in the workpad. Every Linear issue you create must also
+  use this assignee.
 - Treat a single persistent Linear comment as the source of truth for progress.
 - Use that single workpad comment for all progress and handoff notes; do not post separate "done"/summary comments.
 - Treat any ticket-authored `Validation`, `Test Plan`, or `Testing` section as non-negotiable acceptance input: mirror it in the workpad and execute it before considering the work complete.
 - When meaningful out-of-scope improvements are discovered during execution,
   file a separate Linear issue instead of expanding scope. The follow-up issue
   must include a clear title, description, and acceptance criteria, be placed in
-  `Backlog`, be assigned to the same project as the current issue, link the
-  current issue as `related`, and use `blockedBy` when the follow-up depends on
-  the current issue.
+  `Backlog`, be assigned to Borinschi Ivan in the same project as the current
+  issue, link the current issue as `related`, and use `blockedBy` when the
+  follow-up depends on the current issue.
+- Keep Linear labels accurate on the current issue and on every issue you create.
+  Use these label names exactly, creating any missing label once before applying it:
+  `Bug`, `Improvement`, `Feature`, `Chore`, `Observation`, and `Follow-up`.
+  Apply one best primary classification label:
+  `Bug` for crashes, regressions, faults, sync errors, wrong behavior, or failed
+  acceptance criteria; `Improvement` for performance, UX, refactors, test gaps,
+  harness hardening, or existing-behavior polish; `Feature` for new user-facing
+  capability; `Chore` for tooling, dependencies, docs, maintenance, or
+  infrastructure; `Observation` for validation/monitoring-only work.
+  Add `Follow-up` to every issue created from another issue, and also add
+  `Observation` when a finding came from an observation or monitoring run.
+- Set Linear priority from the request impact on the current issue and every
+  issue you create. Use Linear priority values exactly:
+  `1` Urgent for production down, data loss, security/privacy incidents,
+  release-blocking crashes, or a broken critical workflow with no workaround;
+  `2` High for major regressions, frequent crashes/faults, severe sync
+  failures, important user workflows blocked with a workaround, or explicitly
+  urgent user requests; `3` Medium for normal bugs, normal feature work,
+  observation/validation work, test gaps, and important but non-blocking
+  improvements; `4` Low for minor polish, copy/docs cleanup, small chores, or
+  nice-to-have improvements. Do not leave priority unset unless the issue is
+  terminal and no work will run.
 - Move status only when the matching quality bar is met.
 - Operate autonomously end-to-end unless blocked by missing requirements, secrets, or permissions.
 - Use the blocked-access escape hatch only for true external blockers (missing required tools/auth) after exhausting documented fallbacks.
@@ -105,11 +173,11 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 
 - `Backlog` -> out of scope for this workflow; do not modify.
 - `Todo` -> queued; immediately transition to `In Progress` before active work.
-  - Special case: if a PR is already attached, treat as feedback/rework loop (run full PR feedback sweep, address or explicitly push back, revalidate, return to `Human Review`).
+  - Special case: if a PR is already attached, treat as feedback/rework loop (run full PR feedback sweep, address or explicitly push back, revalidate, return to `Codex Review`).
 - `In Progress` -> implementation actively underway.
-- `Human Review` -> PR is attached and validated; waiting on human approval.
-- `Merging` -> approved by human; execute the `land` skill flow (do not call `gh pr merge` directly).
-- `Rework` -> reviewer requested changes; planning + implementation required.
+- `Codex Review` -> automated reviewer checks the linked PR/diff, validation evidence, and PR feedback state; pass moves to `Merging`, fail moves to `Rework` with review comments in the workpad.
+- `Merging` -> Codex review passed; execute the serialized merge flow. Only one `Merging` issue may run at a time.
+- `Rework` -> Codex review or reviewer feedback requested changes; planning + implementation required.
 - `Done` -> terminal state; no further action required.
 
 ## Step 0: Determine current ticket state and route
@@ -121,8 +189,8 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
    - `Todo` -> immediately move to `In Progress`, then ensure bootstrap workpad comment exists (create if missing), then start execution flow.
      - If PR is already attached, start by reviewing all open PR comments and deciding required changes vs explicit pushback responses.
    - `In Progress` -> continue execution flow from current scratchpad comment.
-   - `Human Review` -> wait and poll for decision/review updates.
-   - `Merging` -> on entry, open and follow `.codex/skills/land/SKILL.md`; do not call `gh pr merge` directly.
+   - `Codex Review` -> run the Codex review flow.
+   - `Merging` -> on entry, run the serialized merge flow.
    - `Rework` -> run rework flow.
    - `Done` -> do nothing and shut down.
 4. Check whether a PR already exists for the current branch and whether it is closed.
@@ -167,7 +235,7 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 
 ## PR feedback sweep protocol (required)
 
-When a ticket has an attached PR, run this protocol before moving to `Human Review`:
+When a ticket has an attached PR, run this protocol before moving to `Codex Review`:
 
 1. Identify the PR number from issue links/attachments.
 2. Gather feedback from all channels:
@@ -186,14 +254,14 @@ When a ticket has an attached PR, run this protocol before moving to `Human Revi
 Use this only when completion is blocked by missing required tools or missing auth/permissions that cannot be resolved in-session.
 
 - GitHub is **not** a valid blocker by default. Always try fallback strategies first (alternate remote/auth mode, then continue publish/review flow).
-- Do not move to `Human Review` for GitHub access/auth until all fallback strategies have been attempted and documented in the workpad.
-- If a non-GitHub required tool is missing, or required non-GitHub auth is unavailable, move the ticket to `Human Review` with a short blocker brief in the workpad that includes:
+- Do not move to `Codex Review` for GitHub access/auth until all fallback strategies have been attempted and documented in the workpad.
+- If a non-GitHub required tool is missing, or required non-GitHub auth is unavailable, leave or move the ticket to `Rework` with a short blocker brief in the workpad that includes:
   - what is missing,
   - why it blocks required acceptance/validation,
   - exact human action needed to unblock.
 - Keep the brief concise and action-oriented; do not add extra top-level comments outside the workpad.
 
-## Step 2: Execution phase (Todo -> In Progress -> Human Review)
+## Step 2: Execution phase (Todo -> In Progress -> Codex Review)
 
 1.  Determine current repo state (`branch`, `git status`, `HEAD`) and verify the kickoff `pull` sync result is already recorded in the workpad before implementation continues.
 2.  If current issue state is `Todo`, move it to `In Progress`; otherwise leave the current state unchanged.
@@ -224,33 +292,52 @@ Use this only when completion is blocked by missing required tools or missing au
     - Do not include PR URL in the workpad comment; keep PR linkage on the issue via attachment/link fields.
     - Add a short `### Confusions` section at the bottom when any part of task execution was unclear/confusing, with concise bullets.
     - Do not post any additional completion summary comment.
-11. Before moving to `Human Review`, poll PR feedback and checks:
+11. Before moving to `Codex Review`, poll PR feedback and checks:
     - Read the PR `Manual QA Plan` comment (when present) and use it to sharpen UI/runtime test coverage for the current change.
     - Run the full PR feedback sweep protocol.
     - Confirm PR checks are passing (green) after the latest changes.
     - Confirm every required ticket-provided validation/test-plan item is explicitly marked complete in the workpad.
     - Repeat this check-address-verify loop until no outstanding comments remain and checks are fully passing.
     - Re-open and refresh the workpad before state transition so `Plan`, `Acceptance Criteria`, and `Validation` exactly match completed work.
-12. Only then move issue to `Human Review`.
-    - Exception: if blocked by missing required non-GitHub tools/auth per the blocked-access escape hatch, move to `Human Review` with the blocker brief and explicit unblock actions.
+12. Only then move issue to `Codex Review`.
+    - Exception: if blocked by missing required non-GitHub tools/auth per the blocked-access escape hatch, move to `Rework` with the blocker brief and explicit unblock actions.
 13. For `Todo` tickets that already had a PR attached at kickoff:
     - Ensure all existing PR feedback was reviewed and resolved, including inline review comments (code changes or explicit, justified pushback response).
     - Ensure branch was pushed with any required updates.
-    - Then move to `Human Review`.
+    - Then move to `Codex Review`.
 
-## Step 3: Human Review and merge handling
+## Step 3: Codex Review and merge handling
 
-1. When the issue is in `Human Review`, do not code or change ticket content.
-2. Poll for updates as needed, including GitHub PR review comments from humans and bots.
-3. If review feedback requires changes, move the issue to `Rework` and follow the rework flow.
-4. If approved, human moves the issue to `Merging`.
-5. When the issue is in `Merging`, open and follow `.codex/skills/land/SKILL.md`, then run the `land` skill in a loop until the PR is merged. Do not call `gh pr merge` directly.
-6. After merge is complete, move the issue to `Done`.
+1. When the issue is in `Codex Review`, do not implement new scope or make opportunistic code changes.
+2. Run an independent Codex review of the linked PR/diff, current branch, workpad, acceptance criteria, validation evidence, PR checks, and all existing GitHub review comments.
+3. Record the review result in the existing `## Codex Workpad` comment under a `### Codex Review` section. Do not create a separate completion comment.
+4. If review finds actionable defects, missing validation, unresolved PR feedback, broken acceptance criteria, or risky implementation gaps:
+   - write concise review comments in the workpad with file/line references when available,
+   - keep or update labels/priority if the review changes severity/classification,
+   - move the issue to `Rework`,
+   - stop without implementing the fix in the same turn.
+5. If review passes with no actionable findings:
+   - write `Codex Review: passed` in the workpad with the evidence checked,
+   - move the issue to `Merging`.
+6. When the issue is in `Merging`, run the serialized merge flow:
+   - Re-read `/Users/ivan.borinschi/Work/AGENTS.md` and `/Users/ivan.borinschi/Work/imodeveloperlab/AGENTS.md` before any merge or validation command.
+   - Confirm no other issue is actively in the merge flow. The workflow config also limits `Merging` to one concurrent agent; if another merge is active, stop and let Symphony retry this issue later.
+   - Fetch latest `origin/main`.
+   - Merge or rebase the PR branch onto current `origin/main` before landing. If conflicts appear, resolve them in the branch, rerun required validation, update the workpad with the conflict files and resolutions, commit the conflict resolution, push the branch, and keep the issue in `Merging`.
+   - Create a local post-merge `main` candidate from current `origin/main` plus this one PR branch before doing the final remote merge. This candidate is the place to detect integration regressions while the merge can still be aborted cleanly.
+   - Run the Monitor app unit-test gate against that post-merge `main` candidate:
+     `xcodebuild -workspace /Users/ivan.borinschi/Work/imodeveloperlab/Workspace.xcworkspace -scheme Monitor-Prod -destination 'platform=iOS Simulator,name=Capone,OS=26.2' -skip-testing:DSKitTests test`
+   - If `Capone` is unavailable, use another normal pool simulator from `/Users/ivan.borinschi/Work/AGENTS.md`; never use `Imodeveloper Monitor Watchdog` for this merge validation.
+   - If tests fail or regressions are found, abort the local merge candidate, keep the branch/PR unmerged, add specific failure comments to the workpad including failing command, failing tests, logs, and suspected files, move the issue to `Rework`, and do not mark `Done`.
+   - If tests pass, record the candidate SHA and test command/result in the workpad.
+   - Open and follow `.codex/skills/land/SKILL.md`. Do not call `gh pr merge` directly.
+   - Land exactly one PR/branch, then stop looking for other merge-ready issues. Symphony will dispatch the next `Merging` issue only after this one leaves `Merging`.
+7. After landing, update the main checkout to the merged SHA, confirm it matches the tested candidate or rerun the same Monitor app unit-test gate if it does not, record the final merged SHA in the workpad, then move the issue to `Done`.
 
 ## Step 4: Rework handling
 
 1. Treat `Rework` as a full approach reset, not incremental patching.
-2. Re-read the full issue body and all human comments; explicitly identify what will be done differently this attempt.
+2. Re-read the full issue body, workpad, Codex review comments, and all PR comments; explicitly identify what will be done differently this attempt.
 3. Close the existing PR tied to the issue.
 4. Remove the existing `## Codex Workpad` comment from the issue.
 5. Create a fresh branch from `origin/main`.
@@ -259,7 +346,7 @@ Use this only when completion is blocked by missing required tools or missing au
    - Create a new bootstrap `## Codex Workpad` comment.
    - Build a fresh plan/checklist and execute end-to-end.
 
-## Completion bar before Human Review
+## Completion bar before Codex Review
 
 - Step 1/2 checklist is fully complete and accurately reflected in the single workpad comment.
 - Acceptance criteria and required ticket-provided validation items are complete.
@@ -280,11 +367,19 @@ Use this only when completion is blocked by missing required tools or missing au
 - Temporary proof edits are allowed only for local verification and must be reverted before commit.
 - If out-of-scope improvements are found, create a separate Backlog issue rather
   than expanding current scope, and include a clear
-  title/description/acceptance criteria, same-project assignment, a `related`
-  link to the current issue, and `blockedBy` when the follow-up depends on the
-  current issue.
-- Do not move to `Human Review` unless the `Completion bar before Human Review` is satisfied.
-- In `Human Review`, do not make changes; wait and poll.
+  title/description/acceptance criteria, Borinschi Ivan assignee in the same
+  project, a `related` link to the current issue, and `blockedBy` when the
+  follow-up depends on the current issue.
+- When creating or updating any issue, apply the workflow label policy:
+  current issues get the best matching classification label, and generated
+  follow-up issues get `Follow-up` plus the correct classification labels.
+- When creating or updating any issue, apply the workflow priority policy from
+  the request and evidence; generated follow-up issues must not be left without
+  priority.
+- Do not move to `Codex Review` unless the `Completion bar before Codex Review` is satisfied.
+- In `Codex Review`, review only: pass moves to `Merging`; actionable findings move to `Rework` with comments.
+- `Merging` is serialized. Do not run multiple merge/land agents at the same time, and do not pick up a second merge-ready issue from inside a merge run.
+- A merge is not complete until the post-merge main checkout passes the Monitor app unit-test gate. Failed post-merge validation moves the issue to `Rework` with specific comments instead of `Done`.
 - If state is terminal (`Done`), do nothing and shut down.
 - Keep issue text concise, specific, and reviewer-oriented.
 - If blocked and no workpad exists yet, add one blocker comment describing blocker, impact, and next unblock action.
