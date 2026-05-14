@@ -150,6 +150,41 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule Simulators do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    alias SymphonyElixir.Config.Schema
+
+    @primary_key false
+    embedded_schema do
+      field(:pool, {:array, :string}, default: [])
+
+      field(:required_labels, :map,
+        default: %{
+          "Needs Simulator" => 1,
+          "Needs 2 Simulators" => 2,
+          "Needs 3 Simulators" => 3
+        }
+      )
+
+      field(:block_relation_type, :string, default: "blocks")
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [:pool, :required_labels, :block_relation_type], empty_values: [])
+      |> update_change(:pool, &Schema.normalize_simulator_pool/1)
+      |> update_change(:required_labels, &Schema.normalize_simulator_required_labels/1)
+      |> validate_change(:pool, &Schema.validate_simulator_pool/2)
+      |> validate_change(:required_labels, &Schema.validate_simulator_required_label_counts/2)
+      |> validate_change(:block_relation_type, &Schema.validate_simulator_relation_type/2)
+      |> Schema.validate_required_simulator_pool()
+    end
+  end
+
   defmodule Codex do
     @moduledoc false
     use Ecto.Schema
@@ -231,14 +266,34 @@ defmodule SymphonyElixir.Config.Schema do
       field(:dashboard_enabled, :boolean, default: true)
       field(:refresh_ms, :integer, default: 1_000)
       field(:render_interval_ms, :integer, default: 16)
+      field(:issue_heartbeat_enabled, :boolean, default: false)
+      field(:issue_heartbeat_interval_ms, :integer, default: 300_000)
+      field(:issue_heartbeat_comment_marker, :string, default: "symphony:heartbeat")
+      field(:issue_activity_comments_enabled, :boolean, default: false)
+      field(:issue_activity_comment_interval_ms, :integer, default: 600_000)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:dashboard_enabled, :refresh_ms, :render_interval_ms], empty_values: [])
+      |> cast(
+        attrs,
+        [
+          :dashboard_enabled,
+          :refresh_ms,
+          :render_interval_ms,
+          :issue_heartbeat_enabled,
+          :issue_heartbeat_interval_ms,
+          :issue_heartbeat_comment_marker,
+          :issue_activity_comments_enabled,
+          :issue_activity_comment_interval_ms
+        ],
+        empty_values: []
+      )
       |> validate_number(:refresh_ms, greater_than: 0)
       |> validate_number(:render_interval_ms, greater_than: 0)
+      |> validate_number(:issue_heartbeat_interval_ms, greater_than: 0)
+      |> validate_number(:issue_activity_comment_interval_ms, greater_than: 0)
     end
   end
 
@@ -339,6 +394,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:workspace, Workspace, on_replace: :update, defaults_to_struct: true)
     embeds_one(:worker, Worker, on_replace: :update, defaults_to_struct: true)
     embeds_one(:agent, Agent, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:simulators, Simulators, on_replace: :update, defaults_to_struct: true)
     embeds_one(:codex, Codex, on_replace: :update, defaults_to_struct: true)
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
@@ -424,6 +480,120 @@ defmodule SymphonyElixir.Config.Schema do
     end)
   end
 
+  @doc false
+  @spec normalize_simulator_pool(nil | [term()]) :: [String.t()]
+  def normalize_simulator_pool(nil), do: []
+
+  def normalize_simulator_pool(pool) when is_list(pool) do
+    pool
+    |> Enum.map(&to_string/1)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.uniq()
+  end
+
+  def normalize_simulator_pool(_pool), do: []
+
+  @doc false
+  @spec normalize_simulator_required_labels(nil | map()) :: map()
+  def normalize_simulator_required_labels(nil), do: %{}
+
+  def normalize_simulator_required_labels(labels) when is_map(labels) do
+    Enum.reduce(labels, %{}, fn {label, count}, acc ->
+      label = label |> to_string() |> String.trim()
+      count = normalize_simulator_count(count)
+
+      if label == "" or is_nil(count) do
+        acc
+      else
+        Map.put(acc, label, count)
+      end
+    end)
+  end
+
+  def normalize_simulator_required_labels(_labels), do: %{}
+
+  @doc false
+  @spec validate_simulator_pool(atom(), [String.t()]) :: [{atom(), String.t()}]
+  def validate_simulator_pool(field, pool) when is_list(pool) do
+    if Enum.any?(pool, &(&1 == "")) do
+      [{field, "simulator names must not be blank"}]
+    else
+      []
+    end
+  end
+
+  def validate_simulator_pool(field, _pool), do: [{field, "must be a list of simulator names"}]
+
+  @doc false
+  @spec validate_simulator_required_label_counts(atom(), map()) :: [{atom(), String.t()}]
+  def validate_simulator_required_label_counts(field, labels) when is_map(labels) do
+    Enum.flat_map(labels, fn {label, count} ->
+      cond do
+        to_string(label) == "" ->
+          [{field, "required simulator labels must not be blank"}]
+
+        not is_integer(count) or count <= 0 ->
+          [{field, "required simulator counts must be positive integers"}]
+
+        true ->
+          []
+      end
+    end)
+  end
+
+  def validate_simulator_required_label_counts(field, _labels),
+    do: [{field, "must map label names to simulator counts"}]
+
+  @doc false
+  @spec validate_simulator_relation_type(atom(), String.t()) :: [{atom(), String.t()}]
+  def validate_simulator_relation_type(_field, relation_type) when relation_type in ["blocks", "blocked_by"],
+    do: []
+
+  def validate_simulator_relation_type(field, _relation_type),
+    do: [{field, "must be blocks or blocked_by"}]
+
+  @doc false
+  @spec validate_required_simulator_pool(Ecto.Changeset.t()) :: Ecto.Changeset.t()
+  def validate_required_simulator_pool(changeset) do
+    required_labels = get_field(changeset, :required_labels) || %{}
+    pool = get_field(changeset, :pool) || []
+    pool_size = length(pool)
+
+    if pool_size == 0 do
+      changeset
+    else
+      validate_required_simulator_labels_fit_pool(required_labels, changeset, pool_size)
+    end
+  end
+
+  defp validate_required_simulator_labels_fit_pool(required_labels, changeset, pool_size) do
+    Enum.reduce(required_labels, changeset, &validate_required_simulator_label_fit(&1, &2, pool_size))
+  end
+
+  defp validate_required_simulator_label_fit({_label, count}, changeset, pool_size)
+       when is_integer(count) and count <= pool_size,
+       do: changeset
+
+  defp validate_required_simulator_label_fit({label, count}, changeset, pool_size) do
+    add_error(
+      changeset,
+      :required_labels,
+      "#{label} requires #{inspect(count)} simulators but pool has #{pool_size}"
+    )
+  end
+
+  defp normalize_simulator_count(count) when is_integer(count), do: count
+
+  defp normalize_simulator_count(count) when is_binary(count) do
+    case Integer.parse(String.trim(count)) do
+      {integer, ""} -> integer
+      _ -> nil
+    end
+  end
+
+  defp normalize_simulator_count(_count), do: nil
+
   defp changeset(attrs) do
     %__MODULE__{}
     |> cast(attrs, [])
@@ -432,6 +602,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:workspace, with: &Workspace.changeset/2)
     |> cast_embed(:worker, with: &Worker.changeset/2)
     |> cast_embed(:agent, with: &Agent.changeset/2)
+    |> cast_embed(:simulators, with: &Simulators.changeset/2)
     |> cast_embed(:codex, with: &Codex.changeset/2)
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)

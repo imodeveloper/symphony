@@ -558,6 +558,106 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Orchestrator.should_dispatch_issue_for_test(issue, state)
   end
 
+  test "simulator labels determine claim count and claim available pool names" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      simulator_pool: ["Luciano", "Gambino", "Capone"],
+      simulator_required_labels: %{
+        "Needs Simulator" => 1,
+        "Needs 2 Simulators" => 2,
+        "Needs 3 Simulators" => 3
+      }
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    state = %Orchestrator.State{simulator_claims: %{}}
+
+    issue = %Issue{
+      id: "sim-1",
+      identifier: "MT-SIM-1",
+      title: "Needs one simulator",
+      state: "Todo",
+      labels: ["needs simulator"]
+    }
+
+    assert Orchestrator.simulator_requirement_for_test(issue) == 1
+    assert {:ok, claimed_state, ["Luciano"]} = Orchestrator.claim_simulators_for_test(state, issue)
+    assert_receive {:memory_tracker_add_labels, "sim-1", ["Luciano"]}
+    assert Orchestrator.available_simulators_for_test(claimed_state) == ["Gambino", "Capone"]
+  end
+
+  test "merging issues claim one simulator even without simulator labels" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      simulator_pool: ["Luciano", "Gambino", "Capone"],
+      simulator_required_labels: %{"Needs Simulator" => 1}
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    state = %Orchestrator.State{simulator_claims: %{}}
+
+    issue = %Issue{
+      id: "merge-1",
+      identifier: "MT-MERGE-1",
+      title: "Ready to merge",
+      state: "Merging",
+      labels: []
+    }
+
+    assert Orchestrator.simulator_requirement_for_test(issue) == 1
+    assert {:ok, claimed_state, ["Luciano"]} = Orchestrator.claim_simulators_for_test(state, issue)
+    assert_receive {:memory_tracker_add_labels, "merge-1", ["Luciano"]}
+    assert Orchestrator.available_simulators_for_test(claimed_state) == ["Gambino", "Capone"]
+  end
+
+  test "simulator claim waits and marks dependency when the pool is full" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      simulator_pool: ["Luciano", "Gambino", "Capone"],
+      simulator_required_labels: %{"Needs Simulator" => 1}
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    state = %Orchestrator.State{
+      simulator_claims: %{
+        "holder-1" => %{
+          issue_id: "holder-1",
+          identifier: "MT-HOLDER-1",
+          simulators: ["Luciano"],
+          labels: ["Luciano"]
+        },
+        "holder-2" => %{
+          issue_id: "holder-2",
+          identifier: "MT-HOLDER-2",
+          simulators: ["Gambino"],
+          labels: ["Gambino"]
+        },
+        "holder-3" => %{
+          issue_id: "holder-3",
+          identifier: "MT-HOLDER-3",
+          simulators: ["Capone"],
+          labels: ["Capone"]
+        }
+      }
+    }
+
+    waiting_issue = %Issue{
+      id: "waiter-1",
+      identifier: "MT-WAITER-1",
+      title: "Needs one simulator",
+      state: "Todo",
+      labels: ["Needs Simulator"],
+      blocked_by: []
+    }
+
+    assert {:wait, ^state} = Orchestrator.claim_simulators_for_test(state, waiting_issue)
+    assert_receive {:memory_tracker_issue_relation, "holder-1", "waiter-1", "blocks"}
+    refute_receive {:memory_tracker_issue_relation, "holder-2", "waiter-1", "blocks"}
+  end
+
   test "dispatch revalidation skips stale todo issue once a non-terminal blocker appears" do
     stale_issue = %Issue{
       id: "blocked-2",
@@ -771,6 +871,11 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.codex.turn_timeout_ms == 3_600_000
     assert config.codex.read_timeout_ms == 5_000
     assert config.codex.stall_timeout_ms == 300_000
+    assert config.observability.issue_heartbeat_enabled == false
+    assert config.observability.issue_heartbeat_interval_ms == 300_000
+    assert config.observability.issue_heartbeat_comment_marker == "symphony:heartbeat"
+    assert config.observability.issue_activity_comments_enabled == false
+    assert config.observability.issue_activity_comment_interval_ms == 600_000
 
     write_workflow_file!(Workflow.workflow_file_path(),
       codex_command: "codex --config 'model=\"gpt-5.5\"' app-server"
@@ -834,6 +939,14 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "codex.stall_timeout_ms"
 
+    write_workflow_file!(Workflow.workflow_file_path(), observability_issue_heartbeat_interval_ms: 0)
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "observability.issue_heartbeat_interval_ms"
+
+    write_workflow_file!(Workflow.workflow_file_path(), observability_issue_activity_comment_interval_ms: 0)
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "observability.issue_activity_comment_interval_ms"
+
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_active_states: %{todo: true},
       tracker_terminal_states: %{done: true},
@@ -845,6 +958,11 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       observability_enabled: "maybe",
       observability_refresh_ms: %{bad: true},
       observability_render_interval_ms: %{bad: true},
+      observability_issue_heartbeat_enabled: "maybe",
+      observability_issue_heartbeat_interval_ms: %{bad: true},
+      observability_issue_heartbeat_comment_marker: 123,
+      observability_issue_activity_comments_enabled: "maybe",
+      observability_issue_activity_comment_interval_ms: %{bad: true},
       server_port: -1,
       server_host: 123
     )

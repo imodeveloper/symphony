@@ -9,7 +9,12 @@ defmodule SymphonyElixir.Tracker do
   @callback fetch_issues_by_states([String.t()]) :: {:ok, [term()]} | {:error, term()}
   @callback fetch_issue_states_by_ids([String.t()]) :: {:ok, [term()]} | {:error, term()}
   @callback create_comment(String.t(), String.t()) :: :ok | {:error, term()}
+  @callback upsert_comment(String.t(), String.t(), String.t(), String.t() | nil) ::
+              {:ok, String.t() | nil} | {:error, term()}
   @callback update_issue_state(String.t(), String.t()) :: :ok | {:error, term()}
+  @callback add_issue_labels(String.t(), [String.t()]) :: :ok | {:error, term()}
+  @callback remove_issue_labels(String.t(), [String.t()]) :: :ok | {:error, term()}
+  @callback create_issue_relation(String.t(), String.t(), String.t()) :: :ok | {:error, term()}
 
   @spec fetch_candidate_issues() :: {:ok, [term()]} | {:error, term()}
   def fetch_candidate_issues do
@@ -31,9 +36,30 @@ defmodule SymphonyElixir.Tracker do
     adapter().create_comment(issue_id, body)
   end
 
+  @spec upsert_comment(String.t(), String.t(), String.t(), String.t() | nil) ::
+          {:ok, String.t() | nil} | {:error, term()}
+  def upsert_comment(issue_id, marker, body, known_comment_id \\ nil) do
+    adapter().upsert_comment(issue_id, marker, body, known_comment_id)
+  end
+
   @spec update_issue_state(String.t(), String.t()) :: :ok | {:error, term()}
   def update_issue_state(issue_id, state_name) do
     adapter().update_issue_state(issue_id, state_name)
+  end
+
+  @spec add_issue_labels(String.t(), [String.t()]) :: :ok | {:error, term()}
+  def add_issue_labels(issue_id, labels) do
+    adapter().add_issue_labels(issue_id, labels)
+  end
+
+  @spec remove_issue_labels(String.t(), [String.t()]) :: :ok | {:error, term()}
+  def remove_issue_labels(issue_id, labels) do
+    adapter().remove_issue_labels(issue_id, labels)
+  end
+
+  @spec create_issue_relation(String.t(), String.t(), String.t()) :: :ok | {:error, term()}
+  def create_issue_relation(issue_id, related_issue_id, relation_type) do
+    adapter().create_issue_relation(issue_id, related_issue_id, relation_type)
   end
 
   @spec adapter() :: module()

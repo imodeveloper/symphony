@@ -267,6 +267,7 @@ Fields:
 - `max_concurrent_agents` (current effective global concurrency limit)
 - `running` (map `issue_id -> running entry`)
 - `claimed` (set of issue IDs reserved/running/retrying)
+- `simulator_claims` (map `issue_id -> claimed simulator names`, OPTIONAL resource extension)
 - `retry_attempts` (map `issue_id -> RetryEntry`)
 - `completed` (set of issue IDs; bookkeeping only, not dispatch gating)
 - `codex_totals` (aggregate tokens + runtime seconds)
@@ -332,7 +333,9 @@ Top-level keys:
 - `workspace`
 - `hooks`
 - `agent`
+- `simulators` (OPTIONAL resource extension)
 - `codex`
+- `observability`
 
 Unknown keys SHOULD be ignored for forward compatibility.
 
@@ -424,7 +427,28 @@ Fields:
   - State keys are normalized (`lowercase`) for lookup.
   - Invalid entries (non-positive or non-numeric) are ignored.
 
-#### 5.3.6 `codex` (object)
+#### 5.3.6 `simulators` (object, OPTIONAL)
+
+Fields:
+
+- `pool` (list of strings)
+  - Shared simulator names available for ordinary app-validation work.
+  - If empty, simulator resource gating is disabled.
+- `required_labels` (map `label_name -> positive integer`)
+  - Issue labels that make a ticket require simulator capacity before dispatch.
+  - The integer is the number of simulators to claim from `pool`.
+  - Repository workflow policy MAY also require simulator capacity from issue state, such as
+    treating a serialized `Merging` issue as requiring one simulator for the merge validation gate.
+- `block_relation_type` (string)
+  - Relation type used when a simulator-needing issue must wait for another issue to release
+    capacity. Default: `blocks`.
+
+When enabled, the orchestrator SHOULD claim enough free simulators before launching a worker,
+apply the claimed simulator names as issue labels, and remove those labels when the worker exits.
+If capacity is unavailable, the orchestrator SHOULD leave the issue undispatched and create tracker
+dependency relations from enough active holder issues to represent the missing simulator capacity.
+
+#### 5.3.7 `codex` (object)
 
 Fields:
 
@@ -453,6 +477,27 @@ fields locally if they want stricter startup checks.
 - `stall_timeout_ms` (integer)
   - Default: `300000` (5 minutes)
   - If `<= 0`, stall detection is disabled.
+
+#### 5.3.8 `observability` (object)
+
+Fields:
+
+- `dashboard_enabled` (boolean)
+  - Default: `true`
+- `refresh_ms` (integer)
+  - Default: `1000`
+- `render_interval_ms` (integer)
+  - Default: `16`
+- `issue_heartbeat_enabled` (boolean)
+  - Default: `false`
+  - When enabled, the orchestrator MAY update one persistent tracker comment per running issue with
+    current progress telemetry.
+- `issue_heartbeat_interval_ms` (integer)
+  - Default: `300000` (5 minutes)
+  - Invalid values fail configuration validation.
+- `issue_heartbeat_comment_marker` (string)
+  - Default: `symphony:heartbeat`
+  - Used to find/reuse the existing heartbeat comment instead of creating repeated comments.
 
 ### 5.4 Prompt Template Contract
 
@@ -587,6 +632,9 @@ not require recognizing or validating extension fields unless that extension is 
 - `agent.max_turns`: integer, default `20`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
+- `simulators.pool`: list of strings, default `[]`
+- `simulators.required_labels`: map of positive integers, default implementation-defined
+- `simulators.block_relation_type`: string, default `blocks`
 - `codex.command`: shell command string, default `codex app-server`
 - `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
 - `codex.thread_sandbox`: Codex `SandboxMode` value, default implementation-defined
@@ -1145,6 +1193,17 @@ An implementation MUST support these tracker adapter operations:
 3. `fetch_issue_states_by_ids(issue_ids)`
    - Used for active-run reconciliation.
 
+4. `add_issue_labels(issue_id, label_names)`
+   - Adds labels without replacing unrelated issue labels.
+   - Implementations MAY create missing labels when the tracker supports it.
+
+5. `remove_issue_labels(issue_id, label_names)`
+   - Removes only the listed labels from the issue.
+
+6. `create_issue_relation(issue_id, related_issue_id, relation_type)`
+   - Creates dependency/relationship metadata between two issues.
+   - Used by resource-gating extensions to mark a waiting issue as blocked by a holder issue.
+
 ### 11.2 Query Semantics (Linear)
 
 Linear-specific requirements for `tracker.kind == "linear"`:
@@ -1156,6 +1215,9 @@ Linear-specific requirements for `tracker.kind == "linear"`:
 - Candidate issue query filters project using `project: { slugId: { eq: $projectSlug } }`
 - Issue-state refresh query uses GraphQL issue IDs with variable type `[ID!]`
 - Pagination REQUIRED for candidate issues
+- Issue label writes SHOULD use `issueUpdate` with `addedLabelIds` / `removedLabelIds`.
+- Issue dependency writes SHOULD use `issueRelationCreate` with `type: "blocks"` when representing
+  one active issue blocking another.
 - Page size default: `50`
 - Network timeout: `30000 ms`
 
@@ -1199,11 +1261,14 @@ Orchestrator behavior on tracker errors:
 
 ### 11.5 Tracker Writes (Important Boundary)
 
-Symphony does not require first-class tracker write APIs in the orchestrator.
+Symphony does not require general first-class tracker write APIs in the orchestrator.
 
 - Ticket mutations (state transitions, comments, PR metadata) are typically handled by the coding
   agent using tools defined by the workflow prompt.
 - The service remains a scheduler/runner and tracker reader.
+- An implementation MAY include narrow, observability-only writes from the orchestrator itself, such
+  as updating a single marked heartbeat comment for a running issue. Such writes MUST NOT replace
+  workflow-owned state transitions, review decisions, PR metadata, or task handoff comments.
 - Workflow-specific success often means "reached the next handoff state" (for example
   `Codex Review`) rather than tracker terminal state `Done`.
 - If the `linear_graphql` client-side tool extension is implemented, it is still part of the agent
@@ -1341,7 +1406,23 @@ If implemented:
 - Treat them as observability-only output.
 - Do not make orchestrator logic depend on humanized strings.
 
-### 13.7 OPTIONAL HTTP Server Extension
+### 13.7 Issue Heartbeat Comments (OPTIONAL)
+
+An implementation MAY publish running-progress telemetry back to the issue tracker as a single
+persistent heartbeat comment per active issue.
+
+If implemented:
+
+- Treat heartbeat comments as observability-only output.
+- Use a stable marker string in the body so the same comment can be found and updated.
+- Prefer updating by known comment ID while the process is alive; fall back to searching recent issue
+  comments for the marker after restart.
+- Include only operational progress signals such as current state, runtime, last agent event, latest
+  humanized signal, token totals, session ID, worker, and workspace.
+- Log update failures and keep the worker running; heartbeat failure MUST NOT fail the issue run.
+- Do not create repeated heartbeat comments for the same issue while the marked comment is available.
+
+### 13.8 OPTIONAL HTTP Server Extension
 
 This section defines an OPTIONAL HTTP interface for observability and operational control.
 
@@ -1370,7 +1451,7 @@ Enablement (extension):
 - Changes to HTTP listener settings (for example `server.port`) do not need to hot-rebind;
   restart-required behavior is conformant.
 
-#### 13.7.1 Human-Readable Dashboard (`/`)
+#### 13.8.1 Human-Readable Dashboard (`/`)
 
 - Host a human-readable dashboard at `/`.
 - The returned document SHOULD depict the current state of the system (for example active sessions,
@@ -1378,7 +1459,7 @@ Enablement (extension):
 - It is up to the implementation whether this is server-generated HTML or a client-side app that
   consumes the JSON API below.
 
-#### 13.7.2 JSON REST API (`/api/v1/*`)
+#### 13.8.2 JSON REST API (`/api/v1/*`)
 
 Provide a JSON REST API under `/api/v1/*` for current runtime state and operational debugging.
 
@@ -2089,14 +2170,14 @@ Use the same validation profiles as Section 17:
 ### 18.2 RECOMMENDED Extensions (Not REQUIRED for Conformance)
 
 - HTTP server extension honors CLI `--port` over `server.port`, uses a safe default bind host, and
-  exposes the baseline endpoints/error semantics in Section 13.7 if shipped.
+  exposes the baseline endpoints/error semantics in Section 13.8 if shipped.
 - `linear_graphql` client-side tool extension exposes raw Linear GraphQL access through the
   app-server session using configured Symphony auth.
 - TODO: Persist retry queue and session metadata across process restarts.
-- TODO: Make observability settings configurable in workflow front matter without prescribing UI
-  implementation details.
-- TODO: Add first-class tracker write APIs (comments/state transitions) in the orchestrator instead
-  of only via agent tools.
+- TODO: Persist retry queue, session metadata, and last known heartbeat comment IDs across process
+  restarts.
+- TODO: Add broader first-class tracker write APIs (state transitions, review decisions, PR
+  metadata) only if they can remain distinct from workflow-owned agent behavior.
 - TODO: Add pluggable issue tracker adapters beyond Linear.
 
 ### 18.3 Operational Validation Before Production (RECOMMENDED)

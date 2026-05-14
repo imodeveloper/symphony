@@ -1,6 +1,95 @@
 defmodule SymphonyElixir.OperationsTest do
   use SymphonyElixir.TestSupport
 
+  defmodule FakeLinearClient do
+    def graphql(query, variables) do
+      send(Application.fetch_env!(:symphony_elixir, :operations_test_recipient), {:graphql, query, variables})
+
+      cond do
+        String.contains?(query, "SymphonyWatchdogProject") ->
+          {:ok,
+           %{
+             "data" => %{
+               "projects" => %{
+                 "nodes" => [
+                   %{"id" => "project-1", "teams" => %{"nodes" => [%{"id" => "team-1"}]}}
+                 ]
+               }
+             }
+           }}
+
+        String.contains?(query, "SymphonyWatchdogTeam") ->
+          {:ok,
+           %{
+             "data" => %{
+               "team" => %{
+                 "states" => %{"nodes" => [%{"id" => "state-todo", "name" => "Todo"}]},
+                 "labels" => %{"nodes" => [%{"id" => "label-chore", "name" => "Chore"}]}
+               }
+             }
+           }}
+
+        String.contains?(query, "SymphonyWatchdogIssue") ->
+          state_name = Application.get_env(:symphony_elixir, :operations_test_watchdog_state, "Done")
+
+          {:ok,
+           %{
+             "data" => %{
+               "issues" => %{
+                 "nodes" => [
+                   %{
+                     "id" => "issue-watchdog",
+                     "identifier" => "IMO-8",
+                     "title" => "Monitor Watchdog",
+                     "url" => "https://linear.example/IMO-8",
+                     "state" => %{"name" => state_name}
+                   }
+                 ]
+               }
+             }
+           }}
+
+        String.contains?(query, "SymphonyPulseWatchdogIssue") ->
+          state_name =
+            if Map.has_key?(variables.input, :stateId) do
+              "Todo"
+            else
+              Application.get_env(:symphony_elixir, :operations_test_watchdog_state, "Todo")
+            end
+
+          {:ok,
+           %{
+             "data" => %{
+               "issueUpdate" => %{
+                 "success" => true,
+                 "issue" => %{
+                   "id" => variables.issueId,
+                   "identifier" => "IMO-8",
+                   "title" => "Monitor Watchdog",
+                   "url" => "https://linear.example/IMO-8",
+                   "state" => %{"name" => state_name}
+                 }
+               }
+             }
+           }}
+      end
+    end
+  end
+
+  setup do
+    linear_client_module = Application.get_env(:symphony_elixir, :linear_client_module)
+    operations_test_recipient = Application.get_env(:symphony_elixir, :operations_test_recipient)
+    operations_test_watchdog_state = Application.get_env(:symphony_elixir, :operations_test_watchdog_state)
+
+    on_exit(fn ->
+      restore_application_env(:linear_client_module, linear_client_module)
+      restore_application_env(:operations_test_recipient, operations_test_recipient)
+      restore_application_env(:operations_test_watchdog_state, operations_test_watchdog_state)
+    end)
+
+    :ok
+  end
+
   test "parses df output into byte counts" do
     output = """
     Filesystem 1024-blocks Used Available Capacity Mounted on
@@ -77,6 +166,89 @@ defmodule SymphonyElixir.OperationsTest do
     assert File.dir?(active_path)
   end
 
+  test "watchdog issue pulse refreshes quick-run metadata on inactive issue" do
+    description = "Quick watchdog description"
+    Application.put_env(:symphony_elixir, :linear_client_module, FakeLinearClient)
+    Application.put_env(:symphony_elixir, :operations_test_recipient, self())
+    Application.put_env(:symphony_elixir, :operations_test_watchdog_state, "Done")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      operations_watchdog_issue_enabled: true,
+      operations_watchdog_issue_title: "Monitor Watchdog",
+      operations_watchdog_issue_description: description,
+      operations_watchdog_issue_state: "Todo",
+      operations_watchdog_issue_assignee_id: "user-1",
+      operations_watchdog_issue_priority: 3,
+      operations_watchdog_issue_labels: ["Chore"]
+    )
+
+    {:ok, pid} =
+      SymphonyElixir.Operations.start_link(
+        name: :"operations-watchdog-test-#{System.unique_integer([:positive])}",
+        auto_schedule?: false
+      )
+
+    send(pid, :ensure_watchdog_issue)
+
+    watchdog = wait_for_watchdog_check(pid)
+    assert watchdog.status == "ready"
+    assert watchdog.action == "pulsed"
+
+    assert_receive {:graphql, update_query,
+                    %{
+                      issueId: "issue-watchdog",
+                      input: %{
+                        assigneeId: "user-1",
+                        description: ^description,
+                        priority: 3,
+                        stateId: "state-todo"
+                      }
+                    }}
+
+    assert update_query =~ "IssueUpdateInput"
+  end
+
+  test "active watchdog issue keeps state and still refreshes quick-run metadata" do
+    description = "Quick active watchdog description"
+    Application.put_env(:symphony_elixir, :linear_client_module, FakeLinearClient)
+    Application.put_env(:symphony_elixir, :operations_test_recipient, self())
+    Application.put_env(:symphony_elixir, :operations_test_watchdog_state, "Todo")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      operations_watchdog_issue_enabled: true,
+      operations_watchdog_issue_title: "Monitor Watchdog",
+      operations_watchdog_issue_description: description,
+      operations_watchdog_issue_state: "Todo",
+      operations_watchdog_issue_assignee_id: "user-1",
+      operations_watchdog_issue_priority: 3,
+      operations_watchdog_issue_labels: ["Chore"]
+    )
+
+    {:ok, pid} =
+      SymphonyElixir.Operations.start_link(
+        name: :"operations-active-watchdog-test-#{System.unique_integer([:positive])}",
+        auto_schedule?: false
+      )
+
+    send(pid, :ensure_watchdog_issue)
+
+    watchdog = wait_for_watchdog_check(pid)
+    assert watchdog.status == "ready"
+    assert watchdog.action == "already_active"
+
+    assert_receive {:graphql, _update_query,
+                    %{
+                      issueId: "issue-watchdog",
+                      input: %{
+                        assigneeId: "user-1",
+                        description: ^description,
+                        priority: 3
+                      }
+                    }}
+
+    refute_receive {:graphql, _update_query, %{input: %{stateId: _state_id}}}
+  end
+
   defp wait_for_dispatch_pause(pid, deadline_ms \\ System.monotonic_time(:millisecond) + 500) do
     pause = SymphonyElixir.Operations.dispatch_pause(pid)
 
@@ -106,4 +278,22 @@ defmodule SymphonyElixir.OperationsTest do
       end
     end
   end
+
+  defp wait_for_watchdog_check(pid, deadline_ms \\ System.monotonic_time(:millisecond) + 500) do
+    watchdog = SymphonyElixir.Operations.snapshot(pid).linear_watchdog
+
+    if watchdog.status != "unknown" do
+      watchdog
+    else
+      if System.monotonic_time(:millisecond) > deadline_ms do
+        flunk("watchdog issue check did not complete")
+      else
+        Process.sleep(10)
+        wait_for_watchdog_check(pid, deadline_ms)
+      end
+    end
+  end
+
+  defp restore_application_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
+  defp restore_application_env(key, value), do: Application.put_env(:symphony_elixir, key, value)
 end

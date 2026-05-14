@@ -107,6 +107,13 @@ defmodule SymphonyElixir.TestSupport do
           max_turns: 20,
           max_retry_backoff_ms: 300_000,
           max_concurrent_agents_by_state: %{},
+          simulator_pool: [],
+          simulator_required_labels: %{
+            "Needs Simulator" => 1,
+            "Needs 2 Simulators" => 2,
+            "Needs 3 Simulators" => 3
+          },
+          simulator_block_relation_type: "blocks",
           codex_command: "codex app-server",
           codex_approval_policy: %{reject: %{sandbox_approval: true, rules: true, mcp_elicitations: true}},
           codex_thread_sandbox: "workspace-write",
@@ -122,6 +129,11 @@ defmodule SymphonyElixir.TestSupport do
           observability_enabled: true,
           observability_refresh_ms: 1_000,
           observability_render_interval_ms: 16,
+          observability_issue_heartbeat_enabled: false,
+          observability_issue_heartbeat_interval_ms: 300_000,
+          observability_issue_heartbeat_comment_marker: "symphony:heartbeat",
+          observability_issue_activity_comments_enabled: false,
+          observability_issue_activity_comment_interval_ms: 600_000,
           operations_disk_path: nil,
           operations_disk_pause_threshold_bytes: 5 * 1024 * 1024 * 1024,
           operations_disk_check_interval_ms: 60_000,
@@ -164,6 +176,9 @@ defmodule SymphonyElixir.TestSupport do
     max_turns = Keyword.get(config, :max_turns)
     max_retry_backoff_ms = Keyword.get(config, :max_retry_backoff_ms)
     max_concurrent_agents_by_state = Keyword.get(config, :max_concurrent_agents_by_state)
+    simulator_pool = Keyword.get(config, :simulator_pool)
+    simulator_required_labels = Keyword.get(config, :simulator_required_labels)
+    simulator_block_relation_type = Keyword.get(config, :simulator_block_relation_type)
     codex_command = Keyword.get(config, :codex_command)
     codex_approval_policy = Keyword.get(config, :codex_approval_policy)
     codex_thread_sandbox = Keyword.get(config, :codex_thread_sandbox)
@@ -179,6 +194,20 @@ defmodule SymphonyElixir.TestSupport do
     observability_enabled = Keyword.get(config, :observability_enabled)
     observability_refresh_ms = Keyword.get(config, :observability_refresh_ms)
     observability_render_interval_ms = Keyword.get(config, :observability_render_interval_ms)
+    observability_issue_heartbeat_enabled = Keyword.get(config, :observability_issue_heartbeat_enabled)
+
+    observability_issue_heartbeat_interval_ms =
+      Keyword.get(config, :observability_issue_heartbeat_interval_ms)
+
+    observability_issue_heartbeat_comment_marker =
+      Keyword.get(config, :observability_issue_heartbeat_comment_marker)
+
+    observability_issue_activity_comments_enabled =
+      Keyword.get(config, :observability_issue_activity_comments_enabled)
+
+    observability_issue_activity_comment_interval_ms =
+      Keyword.get(config, :observability_issue_activity_comment_interval_ms)
+
     operations_disk_path = Keyword.get(config, :operations_disk_path)
     operations_disk_pause_threshold_bytes = Keyword.get(config, :operations_disk_pause_threshold_bytes)
     operations_disk_check_interval_ms = Keyword.get(config, :operations_disk_check_interval_ms)
@@ -239,6 +268,7 @@ defmodule SymphonyElixir.TestSupport do
         "  max_turns: #{yaml_value(max_turns)}",
         "  max_retry_backoff_ms: #{yaml_value(max_retry_backoff_ms)}",
         "  max_concurrent_agents_by_state: #{yaml_value(max_concurrent_agents_by_state)}",
+        simulators_yaml(simulator_pool, simulator_required_labels, simulator_block_relation_type),
         "codex:",
         "  command: #{yaml_value(codex_command)}",
         "  approval_policy: #{yaml_value(codex_approval_policy)}",
@@ -248,7 +278,16 @@ defmodule SymphonyElixir.TestSupport do
         "  read_timeout_ms: #{yaml_value(codex_read_timeout_ms)}",
         "  stall_timeout_ms: #{yaml_value(codex_stall_timeout_ms)}",
         hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
-        observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),
+        observability_yaml(
+          observability_enabled,
+          observability_refresh_ms,
+          observability_render_interval_ms,
+          observability_issue_heartbeat_enabled,
+          observability_issue_heartbeat_interval_ms,
+          observability_issue_heartbeat_comment_marker,
+          observability_issue_activity_comments_enabled,
+          observability_issue_activity_comment_interval_ms
+        ),
         operations_yaml(operations_config),
         server_yaml(server_port, server_host),
         "---",
@@ -311,12 +350,41 @@ defmodule SymphonyElixir.TestSupport do
     |> Enum.join("\n")
   end
 
-  defp observability_yaml(enabled, refresh_ms, render_interval_ms) do
+  defp simulators_yaml(pool, required_labels, block_relation_type)
+       when pool in [nil, []] and required_labels in [nil, %{}] and block_relation_type in [nil, "blocks"],
+       do: nil
+
+  defp simulators_yaml(pool, required_labels, block_relation_type) do
+    [
+      "simulators:",
+      "  pool: #{yaml_value(pool)}",
+      "  required_labels: #{yaml_value(required_labels)}",
+      "  block_relation_type: #{yaml_value(block_relation_type)}"
+    ]
+    |> Enum.reject(&(&1 in [nil, false]))
+    |> Enum.join("\n")
+  end
+
+  defp observability_yaml(
+         enabled,
+         refresh_ms,
+         render_interval_ms,
+         issue_heartbeat_enabled,
+         issue_heartbeat_interval_ms,
+         issue_heartbeat_comment_marker,
+         issue_activity_comments_enabled,
+         issue_activity_comment_interval_ms
+       ) do
     [
       "observability:",
       "  dashboard_enabled: #{yaml_value(enabled)}",
       "  refresh_ms: #{yaml_value(refresh_ms)}",
-      "  render_interval_ms: #{yaml_value(render_interval_ms)}"
+      "  render_interval_ms: #{yaml_value(render_interval_ms)}",
+      "  issue_heartbeat_enabled: #{yaml_value(issue_heartbeat_enabled)}",
+      "  issue_heartbeat_interval_ms: #{yaml_value(issue_heartbeat_interval_ms)}",
+      "  issue_heartbeat_comment_marker: #{yaml_value(issue_heartbeat_comment_marker)}",
+      "  issue_activity_comments_enabled: #{yaml_value(issue_activity_comments_enabled)}",
+      "  issue_activity_comment_interval_ms: #{yaml_value(issue_activity_comment_interval_ms)}"
     ]
     |> Enum.join("\n")
   end

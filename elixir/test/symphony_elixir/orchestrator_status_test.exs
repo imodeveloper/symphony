@@ -101,6 +101,192 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
            }
   end
 
+  test "orchestrator writes progress heartbeat comments for running issues" do
+    issue_id = "issue-heartbeat"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-HEART",
+      title: "Heartbeat test",
+      description: "Publish current progress",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-HEART"
+    }
+
+    write_workflow_file!(
+      Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      observability_issue_heartbeat_enabled: true,
+      observability_issue_heartbeat_interval_ms: 60_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    orchestrator_name = Module.concat(__MODULE__, :HeartbeatOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+    now = DateTime.utc_now()
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: "thread-heartbeat",
+      turn_count: 3,
+      last_codex_message: %{
+        event: :notification,
+        message: %{
+          "method" => "codex/event/agent_message_content_delta",
+          "params" => %{
+            "msg" => %{"content" => "running focused tests"}
+          }
+        },
+        timestamp: now
+      },
+      last_codex_timestamp: now,
+      last_codex_event: :notification,
+      codex_input_tokens: 12,
+      codex_output_tokens: 8,
+      codex_total_tokens: 20,
+      codex_app_server_pid: nil,
+      started_at: DateTime.add(now, -125, :second),
+      workspace_path: "/tmp/MT-HEART",
+      worker_host: nil,
+      heartbeat_comment_id: nil,
+      heartbeat_last_sent_at: nil,
+      heartbeat_last_error: nil,
+      activity_last_comment_at: nil,
+      activity_last_comment_signal: nil,
+      activity_last_error: nil
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(pid, :issue_heartbeat)
+    expected_comment_id = "memory-comment-#{issue_id}"
+
+    assert_receive {:memory_tracker_upsert_comment, ^issue_id, "symphony:heartbeat", body, nil, ^expected_comment_id}
+
+    assert body =~ "## Symphony Heartbeat"
+    assert body =~ "- Issue: `MT-HEART`"
+    assert body =~ "- State: `In Progress`"
+    assert body =~ "- Runtime: 2m 5s"
+    assert body =~ "- Turn: 3"
+    assert body =~ "running focused tests"
+    assert body =~ "- Tokens: 20 total (in 12 / out 8)"
+    assert body =~ "_Symphony heartbeat marker: `symphony:heartbeat`_"
+
+    snapshot = GenServer.call(pid, :snapshot)
+    assert %{running: [snapshot_entry]} = snapshot
+    assert snapshot_entry.heartbeat_comment_id == expected_comment_id
+    assert snapshot_entry.heartbeat_last_error == nil
+    assert %DateTime{} = snapshot_entry.heartbeat_last_sent_at
+  end
+
+  test "orchestrator writes short activity comments for running issues" do
+    issue_id = "issue-activity"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-ACTIVITY",
+      title: "Activity comment test",
+      description: "Publish short activity updates",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-ACTIVITY"
+    }
+
+    write_workflow_file!(
+      Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      observability_issue_heartbeat_enabled: false,
+      observability_issue_activity_comments_enabled: true,
+      observability_issue_activity_comment_interval_ms: 60_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    orchestrator_name = Module.concat(__MODULE__, :ActivityCommentOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+    now = DateTime.utc_now()
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: "thread-activity",
+      turn_count: 3,
+      last_codex_message: %{
+        event: :notification,
+        message: %{
+          "method" => "codex/event/agent_message_content_delta",
+          "params" => %{
+            "msg" => %{"content" => "running focused tests"}
+          }
+        },
+        timestamp: now
+      },
+      last_codex_timestamp: now,
+      last_codex_event: :notification,
+      codex_input_tokens: 12,
+      codex_output_tokens: 8,
+      codex_total_tokens: 20,
+      codex_app_server_pid: nil,
+      started_at: DateTime.add(now, -125, :second),
+      workspace_path: "/tmp/MT-ACTIVITY",
+      worker_host: nil,
+      heartbeat_comment_id: nil,
+      heartbeat_last_sent_at: nil,
+      heartbeat_last_error: nil,
+      activity_last_comment_at: nil,
+      activity_last_comment_signal: nil,
+      activity_last_error: nil
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(pid, :issue_heartbeat)
+
+    assert_receive {:memory_tracker_comment, ^issue_id, body}
+
+    assert body =~ "Progress update: `MT-ACTIVITY`"
+    assert body =~ "is in `In Progress`"
+    assert body =~ "after 2m 5s"
+    assert body =~ "turn 3"
+    assert body =~ "running focused tests"
+    assert body =~ "_Symphony activity update._"
+
+    snapshot = GenServer.call(pid, :snapshot)
+    assert %{running: [snapshot_entry]} = snapshot
+    assert snapshot_entry.activity_last_error == nil
+    assert snapshot_entry.activity_last_comment_signal =~ "running focused tests"
+    assert %DateTime{} = snapshot_entry.activity_last_comment_at
+  end
+
   test "orchestrator snapshot tracks codex thread totals and app-server pid" do
     issue_id = "issue-usage-snapshot"
 

@@ -33,9 +33,12 @@ defmodule SymphonyElixir.Orchestrator do
       :poll_check_in_progress,
       :tick_timer_ref,
       :tick_token,
+      :issue_heartbeat_timer_ref,
+      :issue_heartbeat_token,
       running: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
+      simulator_claims: %{},
       retry_attempts: %{},
       codex_totals: nil,
       codex_rate_limits: nil
@@ -90,6 +93,19 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info({:tick, _tick_token}, state), do: {:noreply, state}
 
+  def handle_info({:issue_heartbeat, heartbeat_token}, %{issue_heartbeat_token: heartbeat_token} = state)
+      when is_reference(heartbeat_token) do
+    state = run_issue_heartbeat_cycle(state)
+    {:noreply, state}
+  end
+
+  def handle_info({:issue_heartbeat, _heartbeat_token}, state), do: {:noreply, state}
+
+  def handle_info(:issue_heartbeat, state) do
+    state = run_issue_heartbeat_cycle(state)
+    {:noreply, state}
+  end
+
   def handle_info(:tick, state) do
     state = refresh_runtime_config(state)
 
@@ -109,6 +125,7 @@ defmodule SymphonyElixir.Orchestrator do
   def handle_info(:run_poll_cycle, state) do
     state = refresh_runtime_config(state)
     state = maybe_dispatch(state)
+    state = sync_issue_heartbeat_schedule(state)
     state = schedule_tick(state, state.poll_interval_ms)
     state = %{state | poll_check_in_progress: false}
 
@@ -127,6 +144,7 @@ defmodule SymphonyElixir.Orchestrator do
       issue_id ->
         {running_entry, state} = pop_running_entry(state, issue_id)
         state = record_session_completion_totals(state, running_entry)
+        state = release_simulator_claim(state, issue_id, running_entry)
         session_id = running_entry_session_id(running_entry)
 
         state =
@@ -142,6 +160,7 @@ defmodule SymphonyElixir.Orchestrator do
                 worker_host: Map.get(running_entry, :worker_host),
                 workspace_path: Map.get(running_entry, :workspace_path)
               })
+              |> sync_issue_heartbeat_schedule()
 
             _ ->
               Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
@@ -154,6 +173,7 @@ defmodule SymphonyElixir.Orchestrator do
                 worker_host: Map.get(running_entry, :worker_host),
                 workspace_path: Map.get(running_entry, :workspace_path)
               })
+              |> sync_issue_heartbeat_schedule()
           end
 
         Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
@@ -176,7 +196,12 @@ defmodule SymphonyElixir.Orchestrator do
           |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
 
         notify_dashboard()
-        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+
+        state =
+          %{state | running: Map.put(running, issue_id, updated_running_entry)}
+          |> sync_issue_heartbeat_schedule(0)
+
+        {:noreply, state}
     end
   end
 
@@ -197,7 +222,12 @@ defmodule SymphonyElixir.Orchestrator do
           |> apply_codex_rate_limits(update)
 
         notify_dashboard()
-        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+
+        state =
+          %{state | running: Map.put(running, issue_id, updated_running_entry)}
+          |> sync_issue_heartbeat_schedule()
+
+        {:noreply, state}
     end
   end
 
@@ -340,6 +370,24 @@ defmodule SymphonyElixir.Orchestrator do
     select_worker_host(state, preferred_worker_host)
   end
 
+  @doc false
+  @spec simulator_requirement_for_test(Issue.t()) :: non_neg_integer()
+  def simulator_requirement_for_test(%Issue{} = issue) do
+    simulator_requirement(issue)
+  end
+
+  @doc false
+  @spec available_simulators_for_test(term()) :: [String.t()]
+  def available_simulators_for_test(%State{} = state) do
+    available_simulators(state)
+  end
+
+  @doc false
+  @spec claim_simulators_for_test(term(), Issue.t()) :: {:ok, term(), [String.t()]} | {:wait, term()}
+  def claim_simulators_for_test(%State{} = state, %Issue{} = issue) do
+    claim_simulators_for_issue(state, issue)
+  end
+
   defp reconcile_running_issue_states([], state, _active_states, _terminal_states), do: state
 
   defp reconcile_running_issue_states([issue | rest], state, active_states, terminal_states) do
@@ -426,6 +474,7 @@ defmodule SymphonyElixir.Orchestrator do
 
       %{pid: pid, ref: ref, identifier: identifier} = running_entry ->
         state = record_session_completion_totals(state, running_entry)
+        state = release_simulator_claim(state, issue_id, running_entry)
         worker_host = Map.get(running_entry, :worker_host)
 
         if cleanup_workspace do
@@ -693,11 +742,18 @@ defmodule SymphonyElixir.Orchestrator do
         state
 
       worker_host ->
-        spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host)
+        case claim_simulators_for_issue(state, issue) do
+          {:ok, state, simulator_names} ->
+            issue = put_simulator_labels_on_issue(issue, simulator_names)
+            spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host, simulator_names)
+
+          {:wait, state} ->
+            state
+        end
     end
   end
 
-  defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
+  defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host, simulator_names) do
     case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
            AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
          end) do
@@ -713,6 +769,7 @@ defmodule SymphonyElixir.Orchestrator do
             identifier: issue.identifier,
             issue: issue,
             worker_host: worker_host,
+            simulators: simulator_names,
             workspace_path: nil,
             session_id: nil,
             last_codex_message: nil,
@@ -727,7 +784,13 @@ defmodule SymphonyElixir.Orchestrator do
             codex_last_reported_total_tokens: 0,
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
-            started_at: DateTime.utc_now()
+            started_at: DateTime.utc_now(),
+            heartbeat_comment_id: nil,
+            heartbeat_last_sent_at: nil,
+            heartbeat_last_error: nil,
+            activity_last_comment_at: nil,
+            activity_last_comment_signal: nil,
+            activity_last_error: nil
           })
 
         %{
@@ -736,18 +799,222 @@ defmodule SymphonyElixir.Orchestrator do
             claimed: MapSet.put(state.claimed, issue.id),
             retry_attempts: Map.delete(state.retry_attempts, issue.id)
         }
+        |> sync_issue_heartbeat_schedule(0)
 
       {:error, reason} ->
         Logger.error("Unable to spawn agent for #{issue_context(issue)}: #{inspect(reason)}")
         next_attempt = if is_integer(attempt), do: attempt + 1, else: nil
 
-        schedule_issue_retry(state, issue.id, next_attempt, %{
+        state
+        |> release_simulator_claim(issue.id, %{simulators: simulator_names})
+        |> schedule_issue_retry(issue.id, next_attempt, %{
           identifier: issue.identifier,
           error: "failed to spawn agent: #{inspect(reason)}",
           worker_host: worker_host
         })
     end
   end
+
+  defp claim_simulators_for_issue(%State{} = state, %Issue{} = issue) do
+    required_count = simulator_requirement(issue)
+
+    cond do
+      required_count <= 0 ->
+        {:ok, state, []}
+
+      length(available_simulators(state)) >= required_count ->
+        simulator_names = Enum.take(available_simulators(state), required_count)
+        claim_simulators(state, issue, simulator_names)
+
+      true ->
+        {:wait, block_issue_on_simulator_holders(state, issue, required_count)}
+    end
+  end
+
+  defp claim_simulators(%State{} = state, %Issue{} = issue, simulator_names) do
+    labels = simulator_label_names(simulator_names)
+
+    case Tracker.add_issue_labels(issue.id, labels) do
+      :ok ->
+        Logger.info("Claimed simulators for #{issue_context(issue)} simulators=#{Enum.join(simulator_names, ",")}")
+
+        state = %{
+          state
+          | simulator_claims:
+              Map.put(state.simulator_claims, issue.id, %{
+                issue_id: issue.id,
+                identifier: issue.identifier,
+                simulators: simulator_names,
+                labels: labels
+              })
+        }
+
+        {:ok, state, simulator_names}
+
+      {:error, reason} ->
+        Logger.warning("Skipping dispatch; failed to label simulator claim for #{issue_context(issue)} labels=#{inspect(labels)} reason=#{inspect(reason)}")
+
+        {:wait, state}
+    end
+  end
+
+  defp block_issue_on_simulator_holders(%State{} = state, %Issue{} = issue, required_count) do
+    available_count = length(available_simulators(state))
+    needed_release_count = max(required_count - available_count, 1)
+    holders = state |> simulator_claim_holders() |> Enum.take(needed_release_count)
+    missing_blockers = missing_simulator_blockers(issue, holders)
+
+    ensure_simulator_blockers(missing_blockers, issue, required_count)
+
+    Logger.info("Simulator pool unavailable for #{issue_context(issue)} required=#{required_count} available=#{available_count}; waiting for release")
+    state
+  end
+
+  defp ensure_simulator_blockers([], issue, required_count) do
+    Logger.debug("Simulator pool unavailable for #{issue_context(issue)} required=#{required_count}; blocker relations already present")
+  end
+
+  defp ensure_simulator_blockers(missing_blockers, issue, _required_count) do
+    Enum.each(missing_blockers, &create_simulator_blocker_relation(issue, &1))
+  end
+
+  defp create_simulator_blocker_relation(%Issue{} = issue, holder) do
+    case Tracker.create_issue_relation(holder.issue_id, issue.id, simulator_block_relation_type()) do
+      :ok ->
+        Logger.info(
+          "Marked issue blocked on simulator holder: blocked_issue_id=#{issue.id} blocked_issue_identifier=#{issue.identifier} holder_issue_id=#{holder.issue_id} holder_issue_identifier=#{holder.identifier}"
+        )
+
+      {:error, reason} ->
+        Logger.warning("Failed to mark simulator blocker relation: blocked_issue_id=#{issue.id} holder_issue_id=#{holder.issue_id} reason=#{inspect(reason)}")
+    end
+  end
+
+  defp missing_simulator_blockers(%Issue{blocked_by: blockers}, holders) when is_list(blockers) do
+    existing_blocker_ids =
+      blockers
+      |> Enum.flat_map(fn
+        %{id: id} when is_binary(id) -> [id]
+        _ -> []
+      end)
+      |> MapSet.new()
+
+    Enum.reject(holders, &MapSet.member?(existing_blocker_ids, &1.issue_id))
+  end
+
+  defp missing_simulator_blockers(_issue, holders), do: holders
+
+  defp simulator_claim_holders(%State{simulator_claims: simulator_claims}) when is_map(simulator_claims) do
+    simulator_claims
+    |> Map.values()
+    |> Enum.reject(&(Map.get(&1, :simulators, []) == []))
+    |> Enum.sort_by(&simulator_claim_sort_key/1)
+  end
+
+  defp simulator_claim_sort_key(claim) when is_map(claim) do
+    pool_index =
+      simulator_pool()
+      |> Enum.with_index()
+      |> Map.new()
+
+    first_simulator =
+      claim
+      |> Map.get(:simulators, [])
+      |> List.first()
+
+    {Map.get(pool_index, first_simulator, 9_999), Map.get(claim, :identifier, ""), Map.get(claim, :issue_id, "")}
+  end
+
+  defp available_simulators(%State{simulator_claims: simulator_claims}) when is_map(simulator_claims) do
+    claimed =
+      simulator_claims
+      |> Map.values()
+      |> Enum.flat_map(&Map.get(&1, :simulators, []))
+      |> MapSet.new()
+
+    simulator_pool()
+    |> Enum.reject(&MapSet.member?(claimed, &1))
+  end
+
+  defp simulator_requirement(%Issue{} = issue) do
+    pool_size = length(simulator_pool())
+
+    do_simulator_requirement(issue, pool_size)
+  end
+
+  defp do_simulator_requirement(_issue, 0), do: 0
+
+  defp do_simulator_requirement(%Issue{} = issue, pool_size) do
+    issue_label_keys =
+      issue
+      |> Issue.label_names()
+      |> Enum.map(&normalize_label_key/1)
+      |> MapSet.new()
+
+    issue_label_keys
+    |> required_simulator_count(issue.state)
+    |> min(pool_size)
+  end
+
+  defp required_simulator_count(issue_label_keys, issue_state) do
+    label_requirement =
+      Config.settings!().simulators.required_labels
+      |> Enum.reduce(0, &simulator_label_requirement(issue_label_keys, &1, &2))
+
+    max(label_requirement, simulator_state_requirement(issue_state))
+  end
+
+  defp simulator_state_requirement("Merging"), do: 1
+
+  defp simulator_state_requirement(issue_state) when is_binary(issue_state) do
+    issue_state
+    |> normalize_label_key()
+    |> case do
+      "merging" -> 1
+      _state -> 0
+    end
+  end
+
+  defp simulator_state_requirement(_issue_state), do: 0
+
+  defp simulator_label_requirement(issue_label_keys, {label, count}, required) do
+    if MapSet.member?(issue_label_keys, normalize_label_key(label)) do
+      max(required, count)
+    else
+      required
+    end
+  end
+
+  defp simulator_pool do
+    Config.settings!().simulators.pool
+  end
+
+  defp simulator_block_relation_type do
+    Config.settings!().simulators.block_relation_type
+  end
+
+  defp simulator_label_names(simulator_names) when is_list(simulator_names) do
+    simulator_names
+    |> Enum.map(&to_string/1)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+  end
+
+  defp put_simulator_labels_on_issue(%Issue{labels: labels} = issue, simulator_names) when is_list(labels) do
+    %{issue | labels: Enum.uniq(labels ++ simulator_label_names(simulator_names))}
+  end
+
+  defp put_simulator_labels_on_issue(%Issue{} = issue, simulator_names) do
+    %{issue | labels: simulator_label_names(simulator_names)}
+  end
+
+  defp normalize_label_key(label) when is_binary(label) do
+    label
+    |> String.trim()
+    |> String.downcase()
+  end
+
+  defp normalize_label_key(label), do: label |> to_string() |> normalize_label_key()
 
   defp revalidate_issue_for_dispatch(%Issue{id: issue_id}, issue_fetcher, terminal_states)
        when is_binary(issue_id) and is_function(issue_fetcher, 1) do
@@ -966,6 +1233,307 @@ defmodule SymphonyElixir.Orchestrator do
     StatusDashboard.notify_update()
   end
 
+  defp run_issue_heartbeat_cycle(%State{} = state) do
+    state =
+      state
+      |> refresh_runtime_config()
+      |> Map.put(:issue_heartbeat_timer_ref, nil)
+      |> Map.put(:issue_heartbeat_token, nil)
+
+    settings = Config.settings!().observability
+
+    state =
+      if settings.issue_heartbeat_enabled == true do
+        emit_issue_heartbeats(state, settings)
+      else
+        state
+      end
+
+    state =
+      if settings.issue_activity_comments_enabled == true do
+        emit_issue_activity_comments(state, settings)
+      else
+        state
+      end
+
+    state =
+      state
+      |> sync_issue_heartbeat_schedule()
+
+    notify_dashboard()
+    state
+  end
+
+  defp emit_issue_heartbeats(%State{running: running} = state, settings) do
+    now = DateTime.utc_now()
+    marker = issue_heartbeat_marker(settings.issue_heartbeat_comment_marker)
+
+    running =
+      Enum.reduce(running, running, fn {issue_id, running_entry}, acc ->
+        Map.put(acc, issue_id, emit_issue_heartbeat(issue_id, running_entry, now, settings, marker))
+      end)
+
+    %{state | running: running}
+  end
+
+  defp emit_issue_heartbeat(issue_id, running_entry, now, settings, marker) do
+    body = issue_heartbeat_body(issue_id, running_entry, now, settings, marker)
+    known_comment_id = Map.get(running_entry, :heartbeat_comment_id)
+
+    case Tracker.upsert_comment(issue_id, marker, body, known_comment_id) do
+      {:ok, comment_id} ->
+        running_entry
+        |> Map.put(:heartbeat_comment_id, comment_id)
+        |> Map.put(:heartbeat_last_sent_at, now)
+        |> Map.put(:heartbeat_last_error, nil)
+
+      {:error, reason} ->
+        identifier = Map.get(running_entry, :identifier, issue_id)
+        Logger.warning("Failed to update issue heartbeat: issue_id=#{issue_id} issue_identifier=#{identifier} reason=#{inspect(reason)}")
+
+        Map.put(running_entry, :heartbeat_last_error, inspect(reason))
+    end
+  end
+
+  defp emit_issue_activity_comments(%State{running: running} = state, _settings) when map_size(running) == 0,
+    do: state
+
+  defp emit_issue_activity_comments(%State{running: running} = state, settings) do
+    now = DateTime.utc_now()
+
+    running =
+      Enum.reduce(running, running, fn {issue_id, running_entry}, acc ->
+        updated_running_entry =
+          if issue_activity_comment_due?(running_entry, now, settings) do
+            emit_issue_activity_comment(issue_id, running_entry, now)
+          else
+            running_entry
+          end
+
+        Map.put(acc, issue_id, updated_running_entry)
+      end)
+
+    %{state | running: running}
+  end
+
+  defp issue_activity_comment_due?(running_entry, now, settings) do
+    case Map.get(running_entry, :activity_last_comment_at) do
+      %DateTime{} = last_sent_at ->
+        DateTime.diff(now, last_sent_at, :millisecond) >= settings.issue_activity_comment_interval_ms
+
+      _ ->
+        true
+    end
+  end
+
+  defp emit_issue_activity_comment(issue_id, running_entry, now) do
+    signal = issue_activity_signal(running_entry)
+    body = issue_activity_comment_body(issue_id, running_entry, now, signal)
+
+    case Tracker.create_comment(issue_id, body) do
+      :ok ->
+        running_entry
+        |> Map.put(:activity_last_comment_at, now)
+        |> Map.put(:activity_last_comment_signal, signal)
+        |> Map.put(:activity_last_error, nil)
+
+      {:error, reason} ->
+        identifier = Map.get(running_entry, :identifier, issue_id)
+        Logger.warning("Failed to create issue activity comment: issue_id=#{issue_id} issue_identifier=#{identifier} reason=#{inspect(reason)}")
+
+        Map.put(running_entry, :activity_last_error, inspect(reason))
+    end
+  end
+
+  defp sync_issue_heartbeat_schedule(%State{} = state, delay_override_ms \\ nil) do
+    settings = Config.settings!().observability
+
+    cond do
+      issue_progress_updates_enabled?(settings) != true ->
+        cancel_issue_heartbeat_schedule(state)
+
+      map_size(state.running) == 0 ->
+        cancel_issue_heartbeat_schedule(state)
+
+      is_reference(state.issue_heartbeat_timer_ref) ->
+        state
+
+      true ->
+        delay_ms =
+          case delay_override_ms do
+            delay when is_integer(delay) and delay >= 0 -> delay
+            _ -> issue_progress_schedule_interval_ms(settings)
+          end
+
+        schedule_issue_heartbeat(state, delay_ms)
+    end
+  end
+
+  defp schedule_issue_heartbeat(%State{} = state, delay_ms) when is_integer(delay_ms) and delay_ms >= 0 do
+    heartbeat_token = make_ref()
+    timer_ref = Process.send_after(self(), {:issue_heartbeat, heartbeat_token}, delay_ms)
+
+    %{state | issue_heartbeat_timer_ref: timer_ref, issue_heartbeat_token: heartbeat_token}
+  end
+
+  defp cancel_issue_heartbeat_schedule(%State{} = state) do
+    if is_reference(state.issue_heartbeat_timer_ref) do
+      Process.cancel_timer(state.issue_heartbeat_timer_ref)
+    end
+
+    %{state | issue_heartbeat_timer_ref: nil, issue_heartbeat_token: nil}
+  end
+
+  defp issue_heartbeat_body(issue_id, running_entry, now, settings, marker) do
+    identifier = Map.get(running_entry, :identifier) || issue_id
+    issue = Map.get(running_entry, :issue) || %{}
+    state = issue_state_for_heartbeat(issue)
+    runtime_seconds = running_seconds(Map.get(running_entry, :started_at), now)
+    last_activity = heartbeat_timestamp(Map.get(running_entry, :last_codex_timestamp))
+    last_event = Map.get(running_entry, :last_codex_event) || "none"
+    latest = StatusDashboard.humanize_codex_message(Map.get(running_entry, :last_codex_message))
+    heartbeat_interval = format_runtime_seconds_for_heartbeat(settings.issue_heartbeat_interval_ms |> div(1000))
+
+    """
+    ## Symphony Heartbeat
+
+    Updated: #{heartbeat_timestamp(now)}
+
+    - Issue: `#{identifier}`
+    - State: `#{state}`
+    - Runtime: #{format_runtime_seconds_for_heartbeat(runtime_seconds)}
+    - Turn: #{Map.get(running_entry, :turn_count, 0)}
+    - Last activity: #{last_activity}
+    - Last event: `#{last_event}`
+    - Latest signal: #{escape_markdown_line(latest)}
+    - Tokens: #{format_int_for_heartbeat(Map.get(running_entry, :codex_total_tokens, 0))} total (in #{format_int_for_heartbeat(Map.get(running_entry, :codex_input_tokens, 0))} / out #{format_int_for_heartbeat(Map.get(running_entry, :codex_output_tokens, 0))})
+    - Session: #{inline_code(Map.get(running_entry, :session_id))}
+    - Worker: #{inline_code(Map.get(running_entry, :worker_host) || "local")}
+    - Workspace: #{inline_code(Map.get(running_entry, :workspace_path))}
+
+    Symphony updates this comment every #{heartbeat_interval} while the issue is active.
+
+    _Symphony heartbeat marker: `#{marker}`_
+    """
+    |> String.trim()
+  end
+
+  defp issue_activity_comment_body(issue_id, running_entry, now, signal) do
+    identifier = Map.get(running_entry, :identifier) || issue_id
+    issue = Map.get(running_entry, :issue) || %{}
+    state = issue_state_for_heartbeat(issue)
+    runtime_seconds = running_seconds(Map.get(running_entry, :started_at), now)
+    turn_count = Map.get(running_entry, :turn_count, 0)
+
+    """
+    Progress update: `#{identifier}` is in `#{state}` after #{format_runtime_seconds_for_heartbeat(runtime_seconds)} (turn #{turn_count}). Latest: #{signal}.
+
+    _Symphony activity update._
+    """
+    |> String.trim()
+  end
+
+  defp issue_activity_signal(running_entry) do
+    running_entry
+    |> Map.get(:last_codex_message)
+    |> StatusDashboard.humanize_codex_message()
+    |> escape_markdown_line()
+    |> String.trim()
+    |> case do
+      "" -> "agent is still running"
+      "no codex message yet" -> "agent is starting"
+      value -> truncate_activity_signal(value)
+    end
+  end
+
+  defp truncate_activity_signal(value) do
+    if String.length(value) > 180 do
+      String.slice(value, 0, 177) <> "..."
+    else
+      value
+    end
+  end
+
+  @doc false
+  @spec issue_heartbeat_body_for_test(String.t(), map(), DateTime.t(), map(), String.t()) :: String.t()
+  def issue_heartbeat_body_for_test(issue_id, running_entry, now, settings, marker) do
+    issue_heartbeat_body(issue_id, running_entry, now, settings, marker)
+  end
+
+  defp issue_heartbeat_marker(marker) when is_binary(marker) do
+    case String.trim(marker) do
+      "" -> "symphony:heartbeat"
+      value -> value
+    end
+  end
+
+  defp issue_heartbeat_marker(_marker), do: "symphony:heartbeat"
+
+  defp issue_progress_updates_enabled?(settings) do
+    settings.issue_heartbeat_enabled == true or settings.issue_activity_comments_enabled == true
+  end
+
+  defp issue_progress_schedule_interval_ms(settings) do
+    intervals =
+      [
+        settings.issue_heartbeat_enabled == true && settings.issue_heartbeat_interval_ms,
+        settings.issue_activity_comments_enabled == true && settings.issue_activity_comment_interval_ms
+      ]
+      |> Enum.filter(&is_integer/1)
+
+    case intervals do
+      [] -> settings.issue_heartbeat_interval_ms
+      values -> Enum.min(values)
+    end
+  end
+
+  defp issue_state_for_heartbeat(%Issue{state: state}) when is_binary(state), do: state
+  defp issue_state_for_heartbeat(%{state: state}) when is_binary(state), do: state
+  defp issue_state_for_heartbeat(_issue), do: "unknown"
+
+  defp heartbeat_timestamp(%DateTime{} = timestamp) do
+    timestamp
+    |> DateTime.truncate(:second)
+    |> DateTime.to_iso8601()
+  end
+
+  defp heartbeat_timestamp(_timestamp), do: "n/a"
+
+  defp format_runtime_seconds_for_heartbeat(seconds) when is_integer(seconds) and seconds >= 0 do
+    hours = div(seconds, 3600)
+    mins = div(rem(seconds, 3600), 60)
+    secs = rem(seconds, 60)
+
+    if hours > 0 do
+      "#{hours}h #{mins}m #{secs}s"
+    else
+      "#{mins}m #{secs}s"
+    end
+  end
+
+  defp format_runtime_seconds_for_heartbeat(_seconds), do: "0m 0s"
+
+  defp format_int_for_heartbeat(value) when is_integer(value), do: Integer.to_string(value)
+  defp format_int_for_heartbeat(_value), do: "0"
+
+  defp inline_code(nil), do: "`n/a`"
+
+  defp inline_code(value) do
+    escaped =
+      value
+      |> to_string()
+      |> String.replace("`", "'")
+
+    "`#{escaped}`"
+  end
+
+  defp escape_markdown_line(value) do
+    value
+    |> to_string()
+    |> String.replace("\n", " ")
+    |> String.replace("\r", " ")
+  end
+
   defp operations_dispatch_pause do
     Operations.dispatch_pause()
   rescue
@@ -1039,8 +1607,47 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp release_issue_claim(%State{} = state, issue_id) do
-    %{state | claimed: MapSet.delete(state.claimed, issue_id)}
+    state
+    |> release_simulator_claim(issue_id, nil)
+    |> Map.update!(:claimed, &MapSet.delete(&1, issue_id))
+    |> sync_issue_heartbeat_schedule()
   end
+
+  defp release_simulator_claim(%State{} = state, issue_id, running_entry) when is_binary(issue_id) do
+    claim =
+      Map.get(state.simulator_claims, issue_id) ||
+        simulator_claim_from_running_entry(issue_id, running_entry)
+
+    case claim do
+      %{labels: labels} when is_list(labels) and labels != [] ->
+        case Tracker.remove_issue_labels(issue_id, labels) do
+          :ok ->
+            Logger.info("Released simulator claim for issue_id=#{issue_id} simulators=#{Enum.join(Map.get(claim, :simulators, []), ",")}")
+
+          {:error, reason} ->
+            Logger.warning("Failed to remove simulator claim labels for issue_id=#{issue_id} labels=#{inspect(labels)} reason=#{inspect(reason)}")
+        end
+
+      _ ->
+        :ok
+    end
+
+    %{state | simulator_claims: Map.delete(state.simulator_claims, issue_id)}
+  end
+
+  defp release_simulator_claim(state, _issue_id, _running_entry), do: state
+
+  defp simulator_claim_from_running_entry(issue_id, %{simulators: simulator_names}) when is_list(simulator_names) do
+    labels = simulator_label_names(simulator_names)
+
+    %{
+      issue_id: issue_id,
+      simulators: simulator_names,
+      labels: labels
+    }
+  end
+
+  defp simulator_claim_from_running_entry(_issue_id, _running_entry), do: nil
 
   defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
     cond do
@@ -1233,6 +1840,7 @@ defmodule SymphonyElixir.Orchestrator do
           identifier: metadata.identifier,
           state: metadata.issue.state,
           worker_host: Map.get(metadata, :worker_host),
+          simulators: Map.get(metadata, :simulators, []),
           workspace_path: Map.get(metadata, :workspace_path),
           session_id: metadata.session_id,
           codex_app_server_pid: metadata.codex_app_server_pid,
@@ -1241,6 +1849,12 @@ defmodule SymphonyElixir.Orchestrator do
           codex_total_tokens: metadata.codex_total_tokens,
           turn_count: Map.get(metadata, :turn_count, 0),
           started_at: metadata.started_at,
+          heartbeat_comment_id: Map.get(metadata, :heartbeat_comment_id),
+          heartbeat_last_sent_at: Map.get(metadata, :heartbeat_last_sent_at),
+          heartbeat_last_error: Map.get(metadata, :heartbeat_last_error),
+          activity_last_comment_at: Map.get(metadata, :activity_last_comment_at),
+          activity_last_comment_signal: Map.get(metadata, :activity_last_comment_signal),
+          activity_last_error: Map.get(metadata, :activity_last_error),
           last_codex_timestamp: metadata.last_codex_timestamp,
           last_codex_message: metadata.last_codex_message,
           last_codex_event: metadata.last_codex_event,

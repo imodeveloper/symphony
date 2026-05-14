@@ -78,8 +78,8 @@ defmodule SymphonyElixir.Operations do
   """
 
   @issue_update_mutation """
-  mutation SymphonyPulseWatchdogIssue($issueId: String!, $stateId: String!) {
-    issueUpdate(id: $issueId, input: {stateId: $stateId}) {
+  mutation SymphonyPulseWatchdogIssue($issueId: String!, $input: IssueUpdateInput!) {
+    issueUpdate(id: $issueId, input: $input) {
       success
       issue {
         id
@@ -518,7 +518,7 @@ defmodule SymphonyElixir.Operations do
   defp handle_watchdog_issue(%{state: state_name} = issue, context, operations, active_states)
        when is_binary(state_name) do
     if MapSet.member?(active_states, normalize_state(state_name)) do
-      {:ok, :already_active, issue}
+      refresh_watchdog_issue_metadata(issue, context, operations)
     else
       pulse_watchdog_issue(issue, context, operations)
     end
@@ -544,7 +544,7 @@ defmodule SymphonyElixir.Operations do
   end
 
   defp fetch_watchdog_project(project_slug) when is_binary(project_slug) do
-    with {:ok, response} <- Client.graphql(@project_lookup_query, %{slug: project_slug}),
+    with {:ok, response} <- linear_client_module().graphql(@project_lookup_query, %{slug: project_slug}),
          %{"id" => project_id, "teams" => %{"nodes" => [%{"id" => team_id} | _]}} <-
            get_in(response, ["data", "projects", "nodes", Access.at(0)]) do
       {:ok, %{project_id: project_id, team_id: team_id}}
@@ -557,7 +557,7 @@ defmodule SymphonyElixir.Operations do
   defp fetch_watchdog_project(_project_slug), do: {:error, :missing_linear_project_slug}
 
   defp fetch_watchdog_team_metadata(team_id) when is_binary(team_id) do
-    with {:ok, response} <- Client.graphql(@team_metadata_query, %{teamId: team_id}),
+    with {:ok, response} <- linear_client_module().graphql(@team_metadata_query, %{teamId: team_id}),
          %{"states" => %{"nodes" => states}, "labels" => %{"nodes" => labels}} <-
            get_in(response, ["data", "team"]) do
       {:ok, %{states: states, labels: labels}}
@@ -568,7 +568,8 @@ defmodule SymphonyElixir.Operations do
   end
 
   defp find_watchdog_issue(project_id, title) when is_binary(project_id) and is_binary(title) do
-    with {:ok, response} <- Client.graphql(@issue_search_query, %{projectId: project_id, title: title}) do
+    with {:ok, response} <-
+           linear_client_module().graphql(@issue_search_query, %{projectId: project_id, title: title}) do
       issue =
         response
         |> get_in(["data", "issues", "nodes"])
@@ -593,7 +594,7 @@ defmodule SymphonyElixir.Operations do
       }
       |> maybe_put(:assigneeId, blank_to_nil(operations.watchdog_issue_assignee_id))
 
-    with {:ok, response} <- Client.graphql(@issue_create_mutation, %{input: input}),
+    with {:ok, response} <- linear_client_module().graphql(@issue_create_mutation, %{input: input}),
          true <- get_in(response, ["data", "issueCreate", "success"]) == true,
          %{} = issue <- get_in(response, ["data", "issueCreate", "issue"]) do
       {:ok, :created, normalize_watchdog_issue(issue)}
@@ -603,16 +604,41 @@ defmodule SymphonyElixir.Operations do
     end
   end
 
-  defp pulse_watchdog_issue(issue, context, _operations) do
+  defp refresh_watchdog_issue_metadata(issue, context, operations) do
+    with {:ok, issue} <- update_watchdog_issue(issue.id, watchdog_issue_metadata_input(context, operations)) do
+      {:ok, :already_active, issue}
+    end
+  end
+
+  defp pulse_watchdog_issue(issue, context, operations) do
+    input =
+      context
+      |> watchdog_issue_metadata_input(operations)
+      |> Map.put(:stateId, context.target_state_id)
+
+    with {:ok, issue} <- update_watchdog_issue(issue.id, input) do
+      {:ok, :pulsed, issue}
+    end
+  end
+
+  defp update_watchdog_issue(issue_id, input) do
     with {:ok, response} <-
-           Client.graphql(@issue_update_mutation, %{issueId: issue.id, stateId: context.target_state_id}),
+           linear_client_module().graphql(@issue_update_mutation, %{issueId: issue_id, input: input}),
          true <- get_in(response, ["data", "issueUpdate", "success"]) == true,
          %{} = updated_issue <- get_in(response, ["data", "issueUpdate", "issue"]) do
-      {:ok, :pulsed, normalize_watchdog_issue(updated_issue)}
+      {:ok, normalize_watchdog_issue(updated_issue)}
     else
       {:error, reason} -> {:error, reason}
       _ -> {:error, :watchdog_issue_update_failed}
     end
+  end
+
+  defp watchdog_issue_metadata_input(_context, operations) do
+    %{
+      description: watchdog_issue_description(operations),
+      priority: operations.watchdog_issue_priority
+    }
+    |> maybe_put(:assigneeId, blank_to_nil(operations.watchdog_issue_assignee_id))
   end
 
   defp find_named_id(nodes, name) when is_list(nodes) and is_binary(name) do
@@ -1037,6 +1063,10 @@ defmodule SymphonyElixir.Operations do
     """
     Scheduled by Symphony. Run exactly one Monitor watchdog cycle for the dedicated simulator, update the Codex Workpad, then move this issue to Done. Symphony will move this same issue back to Todo on the next hourly interval when it is not already active.
     """
+  end
+
+  defp linear_client_module do
+    Application.get_env(:symphony_elixir, :linear_client_module, Client)
   end
 
   defp timestamp do

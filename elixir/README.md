@@ -36,6 +36,9 @@ Symphony stops the active agent for that issue and cleans up matching workspaces
 4. Optionally copy the `commit`, `push`, `pull`, `land`, and `linear` skills to your repo.
    - The `linear` skill expects Symphony's `linear_graphql` app-server tool for raw Linear GraphQL
      operations such as comment editing or upload flows.
+   - This local deployment keeps `land` installed globally at
+     `/Users/ivan.borinschi/.codex/skills/land/SKILL.md` and also stages a worktree-local
+     `.codex/skills/land` copy during `hooks.after_create`.
 5. Customize the copied `WORKFLOW.md` file for your project.
    - To get your project's slug, right-click the project and copy its URL. The slug is part of the
      URL.
@@ -117,8 +120,14 @@ hooks:
   after_create: |
     git clone git@github.com:your-org/your-repo.git .
 agent:
-  max_concurrent_agents: 10
+  max_concurrent_agents: 4
   max_turns: 20
+simulators:
+  pool: [Luciano, Gambino, Capone]
+  required_labels:
+    "Needs Simulator": 1
+    "Needs 2 Simulators": 2
+    "Needs 3 Simulators": 3
 codex:
   command: codex app-server
 ---
@@ -142,10 +151,20 @@ Notes:
   Symphony validation.
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
+- This local deployment sets `agent.max_concurrent_agents: 4`, so at most four working agents are
+  active at once before state-specific and resource-specific limits are applied.
 - This local deployment intentionally sets Codex to `danger-full-access` / `dangerFullAccess`
   because Monitor tickets need host access to Xcode, CoreSimulator, simulator logs, and git metadata
   inside issue worktrees. Per-issue work remains separated by the configured workspace root and clone
   hook; this setting is for this Mac-hosted orchestrator, not a general default.
+- `simulators.pool` declares the shared simulator resource pool for ordinary app work. The local
+  pool is `Luciano`, `Gambino`, and `Capone`. Issues that need simulator access must be labeled
+  `Needs Simulator`, `Needs 2 Simulators`, or `Needs 3 Simulators`; Symphony claims the required
+  number of free simulators, applies the claimed simulator names as Linear labels, and removes those
+  claim labels when the worker run exits. When the pool is full, Symphony leaves the issue waiting
+  and creates Linear `blocks` relations from enough active holder issues to represent the missing
+  simulator capacity. `Merging` also claims one simulator automatically so the serialized merge gate
+  does not contend with worker validation.
 - Local Linear issue classification uses the labels `Bug`, `Improvement`, `Feature`, `Chore`,
   `Observation`, and `Follow-up`. The workflow requires agents to apply them to the current issue and
   to any generated follow-up issues.
@@ -155,12 +174,32 @@ Notes:
 - Local Linear priority policy requires agents to set priority from request impact:
   Urgent, High, Medium, or Low. Current and generated issues should not stay at
   `No priority` unless they are terminal and no work will run.
+- The merge flow's canonical land skill is the worktree-local `.codex/skills/land/SKILL.md`,
+  staged from `/Users/ivan.borinschi/Work/CodexOrchestrator/.codex/skills/land` by
+  `hooks.after_create`; `/Users/ivan.borinschi/.codex/skills/land/SKILL.md` is the fallback. The
+  merge-local Monitor gate is unit-only and must run only `MonitorTests`; when the repo has no
+  GitHub checks, run the watcher as `LAND_ALLOW_NO_CHECKS=1 python3 .codex/skills/land/land_watch.py`
+  after recording that local gate.
+- Monitor app validation expects the shared workspace sibling `../dskit-swiftui`. The local
+  `hooks.after_create` ensures `/Users/ivan.borinschi/Work/Worktrees/symphony/dskit-swiftui`
+  points at `/Users/ivan.borinschi/Work/dskit-swiftui` before agent work starts, so Xcode package
+  and project resolution works from Symphony issue worktrees.
+- The local workflow keeps Linear progress comments disabled by default. Use the dashboard and the
+  issue's single `## Codex Workpad` comment for status instead of periodic heartbeat/activity
+  comments.
 - `operations.disk_path` is checked continuously. When free space drops below
   `operations.disk_pause_threshold_bytes`, Symphony pauses dispatch, terminates active agents into
   retry without deleting their workspaces, runs the configured safe cleanup commands, and resumes
   retry dispatch when disk pressure clears. If cleanup has completed and the Mac is still below the
   threshold, `operations.paused_issue_state` can move paused retry tickets to a visible state such as
-  `Rework`.
+  `Rework`. The local cleanup command uses the simulator cleanup skill's broader developer-storage
+  helper. It first runs simulator safe cleanup with `--include-booted` for the named working pool,
+  then reclaims stale Xcode `DerivedData`, old `iOS DeviceSupport` folders while keeping the newest
+  version, SwiftPM caches, and Swift/Xcode build artifacts under worktree/package roots. It does not
+  erase simulators, delete Xcode archives, remove installed Xcode apps, or remove simulator runtime
+  disk images. Whole-simulator deletion remains limited to stale shutdown devices over 1 GiB and
+  older than 7 days, while the named working pool (`Imodeveloper Monitor Watchdog`, `Capone`,
+  `Luciano`, and `Gambino`) is protected from whole-device deletion.
 - `operations.stale_worktree_delete` enables stale workspace pruning under `workspace.root`.
   Symphony skips worktrees for currently active tracker issues and only deletes directories older
   than `operations.stale_worktree_ttl_hours`.
@@ -168,7 +207,10 @@ Notes:
   issue instead of a Codex automation. The local deployment keeps one issue titled
   `Monitor Watchdog: hourly simulator health check`; when it is not already active, Symphony moves
   that same issue back to `Todo` once per hour so the normal Linear -> Symphony -> Codex path runs
-  it.
+  it. The watchdog description is intentionally a quick health check: confirm the dedicated
+  simulator is alive, confirm Monitor is installed/running, rebuild from `main` only when needed,
+  navigate to Today after relaunch, and finish in about five minutes rather than running long
+  observation loops.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run

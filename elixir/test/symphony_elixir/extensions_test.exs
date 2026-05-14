@@ -193,13 +193,32 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert {:ok, [^issue]} = SymphonyElixir.Tracker.fetch_issues_by_states([" in progress ", 42])
     assert {:ok, [^issue]} = SymphonyElixir.Tracker.fetch_issue_states_by_ids(["issue-1"])
     assert :ok = SymphonyElixir.Tracker.create_comment("issue-1", "comment")
+
+    assert {:ok, "memory-comment-issue-1"} =
+             SymphonyElixir.Tracker.upsert_comment("issue-1", "marker", "body")
+
     assert :ok = SymphonyElixir.Tracker.update_issue_state("issue-1", "Done")
+    assert :ok = SymphonyElixir.Tracker.add_issue_labels("issue-1", ["Luciano"])
+    assert :ok = SymphonyElixir.Tracker.remove_issue_labels("issue-1", ["Luciano"])
+    assert :ok = SymphonyElixir.Tracker.create_issue_relation("issue-2", "issue-1", "blocks")
     assert_receive {:memory_tracker_comment, "issue-1", "comment"}
+    assert_receive {:memory_tracker_upsert_comment, "issue-1", "marker", "body", nil, "memory-comment-issue-1"}
+
     assert_receive {:memory_tracker_state_update, "issue-1", "Done"}
+    assert_receive {:memory_tracker_add_labels, "issue-1", ["Luciano"]}
+    assert_receive {:memory_tracker_remove_labels, "issue-1", ["Luciano"]}
+    assert_receive {:memory_tracker_issue_relation, "issue-2", "issue-1", "blocks"}
 
     Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
     assert :ok = Memory.create_comment("issue-1", "quiet")
+
+    assert {:ok, "known-comment"} =
+             Memory.upsert_comment("issue-1", "marker", "quiet", "known-comment")
+
     assert :ok = Memory.update_issue_state("issue-1", "Quiet")
+    assert :ok = Memory.add_issue_labels("issue-1", ["Quiet"])
+    assert :ok = Memory.remove_issue_labels("issue-1", ["Quiet"])
+    assert :ok = Memory.create_issue_relation("issue-2", "issue-1", "blocks")
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "linear")
     assert SymphonyElixir.Tracker.adapter() == Adapter
@@ -243,6 +262,167 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     Process.put({FakeLinearClient, :graphql_result}, :unexpected)
     assert {:error, :comment_create_failed} = Adapter.create_comment("issue-1", "odd")
+
+    Process.put(
+      {FakeLinearClient, :graphql_result},
+      {:ok, %{"data" => %{"commentUpdate" => %{"success" => true}}}}
+    )
+
+    assert {:ok, "comment-known"} =
+             Adapter.upsert_comment("issue-1", "symphony:heartbeat", "updated", "comment-known")
+
+    assert_receive {:graphql_called, update_comment_query, %{body: "updated", commentId: "comment-known"}}
+
+    assert update_comment_query =~ "commentUpdate"
+    assert update_comment_query =~ "skipEditedAt"
+
+    Process.put(
+      {FakeLinearClient, :graphql_results},
+      [
+        {:ok,
+         %{
+           "data" => %{
+             "issue" => %{
+               "comments" => %{
+                 "nodes" => [
+                   %{"id" => "comment-nope", "body" => "ordinary comment"},
+                   %{
+                     "id" => "comment-heartbeat",
+                     "body" => "marker text\n_Symphony heartbeat marker: `symphony:heartbeat`_"
+                   }
+                 ]
+               }
+             }
+           }
+         }},
+        {:ok, %{"data" => %{"commentUpdate" => %{"success" => true}}}}
+      ]
+    )
+
+    assert {:ok, "comment-heartbeat"} =
+             Adapter.upsert_comment("issue-1", "symphony:heartbeat", "refreshed", nil)
+
+    assert_receive {:graphql_called, find_comment_query, %{first: 50, issueId: "issue-1"}}
+    assert find_comment_query =~ "comments"
+
+    assert_receive {:graphql_called, _update_comment_query, %{body: "refreshed", commentId: "comment-heartbeat"}}
+
+    Process.put(
+      {FakeLinearClient, :graphql_results},
+      [
+        {:ok,
+         %{
+           "data" => %{
+             "issue" => %{
+               "comments" => %{"nodes" => [%{"id" => "comment-other", "body" => "other"}]}
+             }
+           }
+         }},
+        {:ok,
+         %{
+           "data" => %{
+             "commentCreate" => %{
+               "success" => true,
+               "comment" => %{"id" => "comment-created"}
+             }
+           }
+         }}
+      ]
+    )
+
+    assert {:ok, "comment-created"} =
+             Adapter.upsert_comment("issue-1", "symphony:heartbeat", "created", nil)
+
+    assert_receive {:graphql_called, _find_comment_query, %{first: 50, issueId: "issue-1"}}
+    assert_receive {:graphql_called, create_comment_query, %{body: "created", issueId: "issue-1"}}
+    assert create_comment_query =~ "commentCreate"
+
+    Process.put(
+      {FakeLinearClient, :graphql_result},
+      {:ok, %{"data" => %{"commentUpdate" => %{"success" => false}}}}
+    )
+
+    assert {:error, :comment_update_failed} =
+             Adapter.upsert_comment("issue-1", "symphony:heartbeat", "broken", "comment-broken")
+
+    Process.put({FakeLinearClient, :graphql_result}, {:error, :update_boom})
+
+    assert {:error, :update_boom} =
+             Adapter.upsert_comment("issue-1", "symphony:heartbeat", "broken", "comment-broken")
+
+    Process.put({FakeLinearClient, :graphql_result}, :unexpected)
+
+    assert {:error, :comment_update_failed} =
+             Adapter.upsert_comment("issue-1", "symphony:heartbeat", "broken", "comment-broken")
+
+    Process.put({FakeLinearClient, :graphql_results}, [{:error, :find_boom}])
+
+    assert {:error, :find_boom} =
+             Adapter.upsert_comment("issue-1", "symphony:heartbeat", "find broken", nil)
+
+    Process.put(
+      {FakeLinearClient, :graphql_results},
+      [
+        {:ok,
+         %{
+           "data" => %{
+             "issue" => %{
+               "comments" => %{
+                 "nodes" => [
+                   %{"id" => "comment-other", "body" => "other"},
+                   :not_a_comment
+                 ]
+               }
+             }
+           }
+         }},
+        {:ok, %{"data" => %{"commentCreate" => %{"success" => false}}}}
+      ]
+    )
+
+    assert {:error, :comment_create_failed} =
+             Adapter.upsert_comment("issue-1", "symphony:heartbeat", "create false", nil)
+
+    Process.put(
+      {FakeLinearClient, :graphql_results},
+      [
+        {:ok, %{"data" => %{"issue" => %{"comments" => %{"nodes" => []}}}}},
+        {:error, :create_boom}
+      ]
+    )
+
+    assert {:error, :create_boom} =
+             Adapter.upsert_comment("issue-1", "symphony:heartbeat", "create error", nil)
+
+    Process.put(
+      {FakeLinearClient, :graphql_results},
+      [
+        {:ok, %{"data" => %{"issue" => %{"comments" => %{"nodes" => []}}}}},
+        :unexpected
+      ]
+    )
+
+    assert {:error, :comment_create_failed} =
+             Adapter.upsert_comment("issue-1", "symphony:heartbeat", "create weird", nil)
+
+    Process.put(
+      {FakeLinearClient, :graphql_results},
+      [
+        {:ok, %{"data" => %{"issue" => %{"comments" => %{"nodes" => []}}}}},
+        {:ok,
+         %{
+           "data" => %{
+             "commentCreate" => %{
+               "success" => true,
+               "comment" => %{"id" => "comment-after-blank-known"}
+             }
+           }
+         }}
+      ]
+    )
+
+    assert {:ok, "comment-after-blank-known"} =
+             Adapter.upsert_comment("issue-1", "symphony:heartbeat", "blank known", "  ")
 
     Process.put(
       {FakeLinearClient, :graphql_results},
@@ -317,6 +497,182 @@ defmodule SymphonyElixir.ExtensionsTest do
     )
 
     assert {:error, :issue_update_failed} = Adapter.update_issue_state("issue-1", "Odd")
+
+    Process.put(
+      {FakeLinearClient, :graphql_results},
+      [
+        {:ok,
+         %{
+           "data" => %{
+             "issue" => %{
+               "team" => %{
+                 "id" => "team-1",
+                 "labels" => %{"nodes" => [%{"id" => "label-luciano", "name" => "Luciano"}]}
+               }
+             }
+           }
+         }},
+        {:ok,
+         %{
+           "data" => %{
+             "issueLabelCreate" => %{
+               "success" => true,
+               "issueLabel" => %{"id" => "label-gambino", "name" => "Gambino"}
+             }
+           }
+         }},
+        {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
+      ]
+    )
+
+    assert :ok = Adapter.add_issue_labels("issue-1", ["Luciano", "Gambino"])
+
+    assert_receive {:graphql_called, label_query, %{first: 100, issueId: "issue-1"}}
+    assert label_query =~ "labels"
+
+    assert_receive {:graphql_called, create_label_query, %{input: %{teamId: "team-1", name: "Gambino", color: "#6B7280"}}}
+
+    assert create_label_query =~ "issueLabelCreate"
+
+    assert_receive {:graphql_called, update_labels_query, %{issueId: "issue-1", input: %{addedLabelIds: ["label-luciano", "label-gambino"]}}}
+
+    assert update_labels_query =~ "issueUpdate"
+
+    Process.put(
+      {FakeLinearClient, :graphql_results},
+      [
+        {:ok,
+         %{
+           "data" => %{
+             "issue" => %{
+               "team" => %{
+                 "id" => "team-1",
+                 "labels" => %{"nodes" => [%{"id" => "label-luciano", "name" => "Luciano"}]}
+               }
+             }
+           }
+         }},
+        {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
+      ]
+    )
+
+    assert :ok = Adapter.remove_issue_labels("issue-1", ["Luciano"])
+    assert_receive {:graphql_called, _label_query, %{first: 100, issueId: "issue-1"}}
+
+    assert_receive {:graphql_called, _remove_labels_query, %{issueId: "issue-1", input: %{removedLabelIds: ["label-luciano"]}}}
+
+    Process.put(
+      {FakeLinearClient, :graphql_result},
+      {:ok, %{"data" => %{"issueRelationCreate" => %{"success" => true}}}}
+    )
+
+    assert :ok = Adapter.create_issue_relation("issue-holder", "issue-waiter", "blocks")
+
+    assert_receive {:graphql_called, relation_query, %{input: %{issueId: "issue-holder", relatedIssueId: "issue-waiter", type: "blocks"}}}
+
+    assert relation_query =~ "issueRelationCreate"
+  end
+
+  test "linear adapter handles simulator label and relation error paths" do
+    Application.put_env(:symphony_elixir, :linear_client_module, FakeLinearClient)
+
+    assert :ok = Adapter.add_issue_labels("issue-1", [" ", ""])
+    assert :ok = Adapter.remove_issue_labels("issue-1", [])
+
+    Process.put({FakeLinearClient, :graphql_results}, [{:error, :labels_boom}])
+    assert {:error, :labels_boom} = Adapter.add_issue_labels("issue-1", ["Luciano"])
+
+    Process.put({FakeLinearClient, :graphql_results}, [{:ok, %{"data" => %{}}}])
+    assert {:error, :issue_team_labels_not_found} = Adapter.remove_issue_labels("issue-1", ["Luciano"])
+
+    Process.put(
+      {FakeLinearClient, :graphql_results},
+      [
+        issue_team_labels_response([:not_a_label, %{"id" => "label-luciano", "name" => "Luciano"}]),
+        {:ok, %{"data" => %{"issueUpdate" => %{"success" => true}}}}
+      ]
+    )
+
+    assert :ok = Adapter.remove_issue_labels("issue-1", ["Luciano"])
+
+    Process.put(
+      {FakeLinearClient, :graphql_results},
+      [issue_team_labels_response([])]
+    )
+
+    assert :ok = Adapter.remove_issue_labels("issue-1", ["Luciano"])
+
+    Process.put(
+      {FakeLinearClient, :graphql_results},
+      [
+        issue_team_labels_response([]),
+        {:ok, %{"data" => %{"issueLabelCreate" => %{"success" => false}}}}
+      ]
+    )
+
+    assert {:error, :issue_label_create_failed} = Adapter.add_issue_labels("issue-1", ["Capone"])
+
+    Process.put(
+      {FakeLinearClient, :graphql_results},
+      [issue_team_labels_response([]), {:error, :create_label_boom}]
+    )
+
+    assert {:error, :create_label_boom} = Adapter.add_issue_labels("issue-1", ["Capone"])
+
+    Process.put(
+      {FakeLinearClient, :graphql_results},
+      [issue_team_labels_response([]), {:ok, %{"data" => %{"issueLabelCreate" => %{"success" => true}}}}]
+    )
+
+    assert {:error, :issue_label_create_failed} = Adapter.add_issue_labels("issue-1", ["Capone"])
+
+    Process.put(
+      {FakeLinearClient, :graphql_results},
+      [
+        issue_team_labels_response([%{"id" => "label-capone", "name" => "Capone"}]),
+        {:ok, %{"data" => %{"issueUpdate" => %{"success" => false}}}}
+      ]
+    )
+
+    assert {:error, :issue_label_update_failed} = Adapter.remove_issue_labels("issue-1", ["Capone"])
+
+    Process.put(
+      {FakeLinearClient, :graphql_results},
+      [
+        issue_team_labels_response([%{"id" => "label-capone", "name" => "Capone"}]),
+        {:error, :update_labels_boom}
+      ]
+    )
+
+    assert {:error, :update_labels_boom} = Adapter.remove_issue_labels("issue-1", ["Capone"])
+
+    Process.put(
+      {FakeLinearClient, :graphql_results},
+      [
+        issue_team_labels_response([%{"id" => "label-capone", "name" => "Capone"}]),
+        :unexpected
+      ]
+    )
+
+    assert {:error, :issue_label_update_failed} = Adapter.remove_issue_labels("issue-1", ["Capone"])
+
+    Process.put(
+      {FakeLinearClient, :graphql_result},
+      {:ok, %{"data" => %{"issueRelationCreate" => %{"success" => false}}}}
+    )
+
+    assert {:error, :issue_relation_create_failed} =
+             Adapter.create_issue_relation("issue-holder", "issue-waiter", "blocks")
+
+    Process.put({FakeLinearClient, :graphql_result}, {:error, :relation_boom})
+
+    assert {:error, :relation_boom} =
+             Adapter.create_issue_relation("issue-holder", "issue-waiter", "blocks")
+
+    Process.put({FakeLinearClient, :graphql_result}, :unexpected)
+
+    assert {:error, :issue_relation_create_failed} =
+             Adapter.create_issue_relation("issue-holder", "issue-waiter", "blocks")
   end
 
   test "phoenix observability api preserves state, issue, and refresh responses" do
@@ -723,6 +1079,20 @@ defmodule SymphonyElixir.ExtensionsTest do
       codex_totals: %{input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42.5},
       rate_limits: %{"primary" => %{"remaining" => 11}}
     }
+  end
+
+  defp issue_team_labels_response(labels) do
+    {:ok,
+     %{
+       "data" => %{
+         "issue" => %{
+           "team" => %{
+             "id" => "team-1",
+             "labels" => %{"nodes" => labels}
+           }
+         }
+       }
+     }}
   end
 
   defp wait_for_bound_port do

@@ -26,7 +26,10 @@ description:
 ## Steps
 
 1. Locate the PR for the current branch.
-2. Confirm the full gauntlet is green locally before any push.
+2. Confirm the full gauntlet is green locally before any push, unless the
+   caller already recorded an equivalent merge-candidate gate for the current
+   PR head and current `origin/main`. In that case, reuse the recorded gate
+   instead of rerunning duplicate expensive local validation.
 3. If the working tree has uncommitted changes, commit with the `commit` skill
    and push with the `push` skill before proceeding.
 4. Check mergeability and conflicts against main.
@@ -105,6 +108,9 @@ updates in parallel:
 
 ```
 python3 .codex/skills/land/land_watch.py
+
+# In repos with no GitHub checks, only after the merge-candidate local gate is recorded:
+LAND_ALLOW_NO_CHECKS=1 python3 .codex/skills/land/land_watch.py
 ```
 
 Exit codes:
@@ -118,6 +124,9 @@ Exit codes:
 - If checks fail, pull details with `gh pr checks` and `gh run view --log`, then
   fix locally, commit with the `commit` skill, push with the `push` skill, and
   re-run the watch.
+- If the repo has no GitHub checks and `LAND_ALLOW_NO_CHECKS=1` is set, the
+  watcher treats the recorded local merge-candidate gate as the check source of
+  truth instead of waiting 120 seconds for nonexistent checks.
 - Use judgment to identify flaky failures. If a failure is a flake (e.g., a
   timeout on only one platform), you may proceed without fixing it.
 - If CI pushes an auto-fix commit (authored by GitHub Actions), it does not

@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.CoreTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.Config.Schema
+
   test "config defaults and validation checks" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: nil,
@@ -21,6 +23,13 @@ defmodule SymphonyElixir.CoreTest do
     assert config.operations.stale_worktree_delete == false
     assert config.operations.watchdog_issue_enabled == false
     assert config.operations.watchdog_issue_interval_ms == 3_600_000
+    assert config.simulators.pool == []
+
+    assert config.simulators.required_labels == %{
+             "Needs Simulator" => 1,
+             "Needs 2 Simulators" => 2,
+             "Needs 3 Simulators" => 3
+           }
 
     write_workflow_file!(Workflow.workflow_file_path(), poll_interval_ms: "invalid")
 
@@ -92,6 +101,59 @@ defmodule SymphonyElixir.CoreTest do
     assert {:error, {:unsupported_tracker_kind, "123"}} = Config.validate!()
   end
 
+  test "simulator resource config validates pool and required labels" do
+    assert Schema.normalize_simulator_pool(nil) == []
+    assert Schema.normalize_simulator_pool("Luciano") == []
+
+    assert Schema.normalize_simulator_required_labels(nil) == %{}
+    assert Schema.normalize_simulator_required_labels(["bad"]) == %{}
+
+    assert Schema.normalize_simulator_required_labels(%{
+             " " => 1,
+             "Needs Simulator" => "1",
+             "Needs Invalid" => "many",
+             "Needs Float" => 1.5
+           }) == %{"Needs Simulator" => 1}
+
+    assert Schema.validate_simulator_pool(:pool, "Luciano") ==
+             [pool: "must be a list of simulator names"]
+
+    assert Schema.validate_simulator_required_label_counts(:required_labels, "bad") ==
+             [required_labels: "must map label names to simulator counts"]
+
+    assert Schema.validate_simulator_required_label_counts(
+             :required_labels,
+             %{"" => 1, "Needs Invalid" => 0}
+           ) == [
+             required_labels: "required simulator labels must not be blank",
+             required_labels: "required simulator counts must be positive integers"
+           ]
+
+    assert Schema.validate_simulator_relation_type(:block_relation_type, "blocked_by") == []
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      simulator_pool: ["Luciano", "Gambino", "Capone"],
+      simulator_required_labels: %{"Needs Simulator" => 1, "Needs 3 Simulators" => 3}
+    )
+
+    config = Config.settings!()
+    assert config.simulators.pool == ["Luciano", "Gambino", "Capone"]
+    assert config.simulators.required_labels == %{"Needs Simulator" => 1, "Needs 3 Simulators" => 3}
+    assert config.simulators.block_relation_type == "blocks"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      simulator_pool: ["Luciano"],
+      simulator_required_labels: %{"Needs 2 Simulators" => 2}
+    )
+
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "simulators.required_labels"
+
+    write_workflow_file!(Workflow.workflow_file_path(), simulator_block_relation_type: "related")
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "simulators.block_relation_type"
+  end
+
   test "operations config validates disk and cleanup settings" do
     write_workflow_file!(Workflow.workflow_file_path(),
       operations_disk_path: "/tmp/symphony-disk",
@@ -150,6 +212,8 @@ defmodule SymphonyElixir.CoreTest do
     hooks = Map.get(config, "hooks", %{})
     assert is_map(hooks)
     assert Map.get(hooks, "after_create") =~ "git clone --depth 1 https://github.com/imodeveloper/imodeveloperlab ."
+    assert Map.get(hooks, "after_create") =~ "/Users/ivan.borinschi/Work/Worktrees/symphony/dskit-swiftui"
+    assert Map.get(hooks, "after_create") =~ "ln -s \"$DSKIT_SOURCE\" \"$DSKIT_SIBLING\""
     assert Map.get(hooks, "after_create") =~ "mise trust || true"
     assert Map.get(hooks, "before_remove") =~ "true"
 
@@ -1014,8 +1078,9 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "This is an unattended orchestration session."
     assert prompt =~ "Only stop early for a true blocker"
     assert prompt =~ "Do not include \"next steps for user\""
-    assert prompt =~ "open and follow `.codex/skills/land/SKILL.md`"
-    assert prompt =~ "Do not call `gh pr merge` directly"
+    assert prompt =~ "open and follow `/Users/ivan.borinschi/.codex/skills/land/SKILL.md`"
+    assert prompt =~ "worktree-local `.codex/skills/land/SKILL.md` copy"
+    assert prompt =~ "Do not call `gh pr merge` directly outside the documented land skill"
     assert prompt =~ "Continuation context:"
     assert prompt =~ "retry attempt #2"
   end

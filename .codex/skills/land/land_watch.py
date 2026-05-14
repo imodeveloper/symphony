@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import asyncio
 import json
+import os
 import random
 import re
 from dataclasses import dataclass
@@ -17,6 +18,10 @@ CODEX_BOTS = {
 }
 MAX_GH_RETRIES = 5
 BASE_GH_BACKOFF_SECONDS = 2
+
+
+def env_truthy(name: str) -> bool:
+    return (os.environ.get(name) or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass
@@ -550,6 +555,13 @@ async def wait_for_checks(head_sha: str, checks_done: asyncio.Event) -> None:
     while True:
         check_runs = await get_check_runs(head_sha)
         if not check_runs:
+            if env_truthy("LAND_ALLOW_NO_CHECKS"):
+                print(
+                    "No checks detected; continuing because LAND_ALLOW_NO_CHECKS=1 "
+                    "and the local merge gate is expected to be recorded.",
+                )
+                checks_done.set()
+                return
             empty_seconds += POLL_SECONDS
             if empty_seconds >= CHECKS_APPEAR_TIMEOUT_SECONDS:
                 print(

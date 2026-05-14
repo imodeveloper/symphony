@@ -24,9 +24,9 @@ operations:
   disk_pause_threshold_bytes: 5368709120
   disk_check_interval_ms: 60000
   paused_retry_interval_ms: 60000
-  cleanup_dry_run_command: python3 /Users/ivan.borinschi/.codex/skills/simulator-storage-cleanup/scripts/cleanup_simulator_storage.py --dry-run --verbose
-  cleanup_command: python3 /Users/ivan.borinschi/.codex/skills/simulator-storage-cleanup/scripts/cleanup_simulator_storage.py --apply --all-safe
-  cleanup_timeout_ms: 900000
+  cleanup_dry_run_command: python3 /Users/ivan.borinschi/.codex/skills/simulator-storage-cleanup/scripts/cleanup_developer_storage.py --dry-run --all-safe --include-booted-simulators --protect-simulator-name "Imodeveloper Monitor Watchdog" --protect-simulator-name Capone --protect-simulator-name Luciano --protect-simulator-name Gambino --derived-data-min-age-hours 6 --device-support-keep-latest 1
+  cleanup_command: python3 /Users/ivan.borinschi/.codex/skills/simulator-storage-cleanup/scripts/cleanup_developer_storage.py --apply --all-safe --include-booted-simulators --protect-simulator-name "Imodeveloper Monitor Watchdog" --protect-simulator-name Capone --protect-simulator-name Luciano --protect-simulator-name Gambino --derived-data-min-age-hours 6 --device-support-keep-latest 1
+  cleanup_timeout_ms: 1800000
   cleanup_cooldown_ms: 1800000
   paused_issue_state: Rework
   stale_worktree_ttl_hours: 168
@@ -44,30 +44,80 @@ operations:
   watchdog_issue_description: |
     This is the Symphony-owned hourly Monitor watchdog task. Do not run this from a Codex automation.
 
+    This must be a quick health check. Target runtime is 5 minutes or less. Do not run one-hour observations, full test suites, broad log audits, unrelated validation, source edits, signing changes, or cleanup outside the explicit disk-pressure guardrail.
+
     Run exactly one watchdog cycle, update the persistent Codex Workpad comment, then move this same issue to `Done`. Symphony will move it back to `Todo` on the next hourly interval when the issue is not already active.
 
-    Required watchdog contract:
+    Quick watchdog contract:
     - First read `/Users/ivan.borinschi/Work/AGENTS.md` and `/Users/ivan.borinschi/Work/imodeveloperlab/AGENTS.md`.
     - Keep this task narrow: do not run unrelated tests, do not modify Monitor source files, do not change signing/project settings, and do not use any simulator except `Imodeveloper Monitor Watchdog` unless you are only reporting a blocker.
     - Check free disk space for `/Users/ivan.borinschi/Work` before heavy work. If it is below 5 GB, do not build and do not boot extra simulators; report `WATCHDOG_PAUSED_DISK_PRESSURE` with the free space.
     - Use repo `/Users/ivan.borinschi/Work/imodeveloperlab`, watchdog worktree `/Users/ivan.borinschi/Work/Worktrees/monitor-watchdog-main`, workspace `Workspace.xcworkspace`, scheme `Monitor-Prod`, bundle id `com.monitor.md`, simulator `Imodeveloper Monitor Watchdog`, and DerivedData `/Users/ivan.borinschi/Work/Worktrees/monitor-watchdog-deriveddata`.
-    - Fetch current `origin/main`. Ensure the watchdog worktree is a clean checkout of that SHA. Rebuild/relaunch only when main changed, no successful SHA is recorded, the app is not installed, or Monitor is not running.
+    - Check that the dedicated simulator is booted/alive. If it is not booted, boot only that simulator.
+    - Check that Monitor (`com.monitor.md`) is installed and running on that simulator.
+    - Fetch current `origin/main` and compare it with the last successful watchdog SHA recorded in the workpad. Ensure the watchdog worktree is a clean checkout of current main only when a rebuild is needed.
+    - Rebuild/install/relaunch only when main changed, no successful SHA is recorded, the app is not installed, or Monitor is not running.
+    - After install/relaunch, navigate Monitor to the Today screen and leave the app open there.
+    - Keep runtime log review shallow: only check that the app process is alive and there is no immediate crash, fatal error, exception, fault, or `sync_error` during startup.
     - If CoreSimulator access fails, stop before building and report `WATCHDOG_PAUSED_RUNTIME_BLOCKER` with the exact failure.
     - If Monitor runtime errors are found, create or update exactly one Linear issue in this project for the distinct failure. Assign Borinschi Ivan, use status `Todo`, labels `Bug`, `Observation`, and `Follow-up`, and set priority based on severity.
-    - Final report must include watchdog status, simulator name/UDID, main SHA, previous successful SHA, whether build/install/relaunch happened, whether Monitor was running, whether logs looked alive, created/updated Linear issue, and blocker reason if blocked.
+    - Final report must include watchdog status, elapsed time, simulator name/UDID, main SHA, previous successful SHA, whether build/install/relaunch happened, whether Monitor was running, whether the app was left on Today, whether logs looked alive, created/updated Linear issue, and blocker reason if blocked.
 hooks:
   after_create: |
     git clone --depth 1 https://github.com/imodeveloper/imodeveloperlab .
+    DSKIT_SOURCE="/Users/ivan.borinschi/Work/dskit-swiftui"
+    DSKIT_SIBLING="/Users/ivan.borinschi/Work/Worktrees/symphony/dskit-swiftui"
+    KEYS_SOURCE="/Users/ivan.borinschi/Work/Keys"
+    KEYS_SIBLING="/Users/ivan.borinschi/Work/Worktrees/symphony/Keys"
+    FASTLANE_ENV_SOURCE="/Users/ivan.borinschi/Work/imodeveloperlab/fastlane/.env"
+    if [ ! -e "$DSKIT_SIBLING" ] && [ ! -L "$DSKIT_SIBLING" ]; then
+      ln -s "$DSKIT_SOURCE" "$DSKIT_SIBLING"
+    fi
+    if [ ! -d "$DSKIT_SIBLING" ]; then
+      echo "Missing required DSKit sibling dependency at $DSKIT_SIBLING; expected source $DSKIT_SOURCE" >&2
+      exit 66
+    fi
+    if [ ! -e "$KEYS_SIBLING" ] && [ ! -L "$KEYS_SIBLING" ]; then
+      ln -s "$KEYS_SOURCE" "$KEYS_SIBLING"
+    fi
+    if [ ! -d "$KEYS_SIBLING" ]; then
+      echo "Missing required Keys sibling dependency at $KEYS_SIBLING; expected source $KEYS_SOURCE" >&2
+      exit 67
+    fi
+    if [ -f "$FASTLANE_ENV_SOURCE" ]; then
+      install -m 600 "$FASTLANE_ENV_SOURCE" fastlane/.env
+    fi
+    mkdir -p .codex/skills
+    if [ -d /Users/ivan.borinschi/Work/CodexOrchestrator/.codex/skills/land ]; then
+      rm -rf .codex/skills/land
+      cp -R /Users/ivan.borinschi/Work/CodexOrchestrator/.codex/skills/land .codex/skills/land
+    elif [ -d /Users/ivan.borinschi/.codex/skills/land ]; then
+      rm -rf .codex/skills/land
+      cp -R /Users/ivan.borinschi/.codex/skills/land .codex/skills/land
+    else
+      echo "Missing required land skill at /Users/ivan.borinschi/.codex/skills/land or /Users/ivan.borinschi/Work/CodexOrchestrator/.codex/skills/land" >&2
+      exit 65
+    fi
     if command -v mise >/dev/null 2>&1; then
       mise trust || true
     fi
   before_remove: |
     true
 agent:
-  max_concurrent_agents: 10
+  max_concurrent_agents: 4
   max_turns: 20
   max_concurrent_agents_by_state:
     Merging: 1
+simulators:
+  pool:
+    - Luciano
+    - Gambino
+    - Capone
+  required_labels:
+    Needs Simulator: 1
+    Needs 2 Simulators: 2
+    Needs 3 Simulators: 3
+  block_relation_type: blocks
 codex:
   command: codex app-server
   approval_policy: never
@@ -146,6 +196,18 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
   infrastructure; `Observation` for validation/monitoring-only work.
   Add `Follow-up` to every issue created from another issue, and also add
   `Observation` when a finding came from an observation or monitoring run.
+- Simulator access is owned by Symphony. Normal Monitor/app work may use only
+  the working simulator pool `Luciano`, `Gambino`, and `Capone`; do not use
+  `Imodeveloper Monitor Watchdog` except for the dedicated watchdog issue.
+  If a ticket needs simulator access, it must carry one of these labels before
+  work that touches a simulator starts:
+  `Needs Simulator`, `Needs 2 Simulators`, or `Needs 3 Simulators`.
+  Symphony will add the claimed simulator names as Linear labels, for example
+  `Luciano`, `Gambino`, or `Capone`, before dispatching the agent. Use only the
+  simulator name labels present on the current issue. If during analysis you
+  discover that the issue needs simulator access but no simulator claim label is
+  present, update the workpad, apply the correct `Needs ...` label, and stop so
+  Symphony can retry after claiming the simulator resource.
 - Set Linear priority from the request impact on the current issue and every
   issue you create. Use Linear priority values exactly:
   `1` Urgent for production down, data loss, security/privacy incidents,
@@ -167,7 +229,7 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 - `commit`: produce clean, logical commits during implementation.
 - `push`: keep remote branch current and publish updates.
 - `pull`: keep branch updated with latest `origin/main` before handoff.
-- `land`: when ticket reaches `Merging`, explicitly open and follow `.codex/skills/land/SKILL.md`, which includes the `land` loop.
+- `land`: when ticket reaches `Merging`, explicitly open and follow `/Users/ivan.borinschi/.codex/skills/land/SKILL.md`. A worktree-local copy is also staged at `.codex/skills/land/SKILL.md` during workspace bootstrap; use that local copy only if the global skill path is unavailable.
 
 ## Status map
 
@@ -321,18 +383,19 @@ Use this only when completion is blocked by missing required tools or missing au
    - move the issue to `Merging`.
 6. When the issue is in `Merging`, run the serialized merge flow:
    - Re-read `/Users/ivan.borinschi/Work/AGENTS.md` and `/Users/ivan.borinschi/Work/imodeveloperlab/AGENTS.md` before any merge or validation command.
-   - Confirm no other issue is actively in the merge flow. The workflow config also limits `Merging` to one concurrent agent; if another merge is active, stop and let Symphony retry this issue later.
+   - Confirm no other agent is actively running the merge flow. The workflow config limits `Merging` to one concurrent agent, so other Linear issues that are merely queued in `Merging` are not blockers by themselves. If another live runner or claimed simulator label proves a different merge is active, stop and let Symphony retry this issue later.
+   - `Merging` requires one claimed simulator from the normal pool even when the ticket does not carry a `Needs Simulator` label. Use the claimed simulator name label already present on the issue, such as `Luciano`, `Gambino`, or `Capone`. If no claimed simulator label is present, stop and let Symphony retry after claiming one.
    - Fetch latest `origin/main`.
    - Merge or rebase the PR branch onto current `origin/main` before landing. If conflicts appear, resolve them in the branch, rerun required validation, update the workpad with the conflict files and resolutions, commit the conflict resolution, push the branch, and keep the issue in `Merging`.
    - Create a local post-merge `main` candidate from current `origin/main` plus this one PR branch before doing the final remote merge. This candidate is the place to detect integration regressions while the merge can still be aborted cleanly.
-   - Run the Monitor app unit-test gate against that post-merge `main` candidate:
-     `xcodebuild -workspace /Users/ivan.borinschi/Work/imodeveloperlab/Workspace.xcworkspace -scheme Monitor-Prod -destination 'platform=iOS Simulator,name=Capone,OS=26.2' -skip-testing:DSKitTests test`
-   - If `Capone` is unavailable, use another normal pool simulator from `/Users/ivan.borinschi/Work/AGENTS.md`; never use `Imodeveloper Monitor Watchdog` for this merge validation.
+   - Run the Monitor app unit-test gate against that post-merge `main` candidate. This gate is unit-only: run only the `MonitorTests` target; do not run `MonitorUITests`, launch tests, `test_sim`, or full scheme UI validation during merging:
+     `xcodebuild -workspace /Users/ivan.borinschi/Work/imodeveloperlab/Workspace.xcworkspace -scheme Monitor-Prod -destination 'platform=iOS Simulator,name=<claimed-simulator>,OS=26.2' -destination-timeout 20 -only-testing:MonitorTests test`
+   - Use only the claimed simulator label from the issue for this merge validation; never use `Imodeveloper Monitor Watchdog`.
    - If tests fail or regressions are found, abort the local merge candidate, keep the branch/PR unmerged, add specific failure comments to the workpad including failing command, failing tests, logs, and suspected files, move the issue to `Rework`, and do not mark `Done`.
    - If tests pass, record the candidate SHA and test command/result in the workpad.
-   - Open and follow `.codex/skills/land/SKILL.md`. Do not call `gh pr merge` directly.
+   - Open and follow the worktree-local `.codex/skills/land/SKILL.md` copy. If that local skill is unavailable, open `/Users/ivan.borinschi/.codex/skills/land/SKILL.md`. Treat the recorded post-merge unit gate as the local gauntlet for the current PR head and `origin/main`; do not rerun duplicate local validation inside the land skill unless the PR head or `origin/main` changed. This repo currently may have no GitHub checks, so after recording the local unit gate run the watcher with `LAND_ALLOW_NO_CHECKS=1 python3 .codex/skills/land/land_watch.py`; if checks exist, the watcher still waits for them. Do not call `gh pr merge` directly outside the documented land skill.
    - Land exactly one PR/branch, then stop looking for other merge-ready issues. Symphony will dispatch the next `Merging` issue only after this one leaves `Merging`.
-7. After landing, update the main checkout to the merged SHA, confirm it matches the tested candidate or rerun the same Monitor app unit-test gate if it does not, record the final merged SHA in the workpad, then move the issue to `Done`.
+7. After landing, update the main checkout to the merged SHA, confirm it matches the tested candidate or rerun the same unit-only Monitor app test gate if it does not, record the final merged SHA in the workpad, then move the issue to `Done`.
 
 ## Step 4: Rework handling
 
@@ -379,7 +442,7 @@ Use this only when completion is blocked by missing required tools or missing au
 - Do not move to `Codex Review` unless the `Completion bar before Codex Review` is satisfied.
 - In `Codex Review`, review only: pass moves to `Merging`; actionable findings move to `Rework` with comments.
 - `Merging` is serialized. Do not run multiple merge/land agents at the same time, and do not pick up a second merge-ready issue from inside a merge run.
-- A merge is not complete until the post-merge main checkout passes the Monitor app unit-test gate. Failed post-merge validation moves the issue to `Rework` with specific comments instead of `Done`.
+- A merge is not complete until the post-merge main checkout passes the unit-only Monitor app test gate. The merge gate must run only `MonitorTests`; failed post-merge validation moves the issue to `Rework` with specific comments instead of `Done`.
 - If state is terminal (`Done`), do nothing and shut down.
 - Keep issue text concise, specific, and reviewer-oriented.
 - If blocked and no workpad exists yet, add one blocker comment describing blocker, impact, and next unblock action.

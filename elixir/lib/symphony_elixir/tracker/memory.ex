@@ -41,9 +41,35 @@ defmodule SymphonyElixir.Tracker.Memory do
     :ok
   end
 
+  @spec upsert_comment(String.t(), String.t(), String.t(), String.t() | nil) ::
+          {:ok, String.t() | nil} | {:error, term()}
+  def upsert_comment(issue_id, marker, body, known_comment_id) do
+    comment_id = known_comment_id || "memory-comment-#{issue_id}"
+    send_event({:memory_tracker_upsert_comment, issue_id, marker, body, known_comment_id, comment_id})
+    {:ok, comment_id}
+  end
+
   @spec update_issue_state(String.t(), String.t()) :: :ok | {:error, term()}
   def update_issue_state(issue_id, state_name) do
     send_event({:memory_tracker_state_update, issue_id, state_name})
+    :ok
+  end
+
+  @spec add_issue_labels(String.t(), [String.t()]) :: :ok | {:error, term()}
+  def add_issue_labels(issue_id, labels) when is_list(labels) do
+    send_event({:memory_tracker_add_labels, issue_id, labels})
+    :ok
+  end
+
+  @spec remove_issue_labels(String.t(), [String.t()]) :: :ok | {:error, term()}
+  def remove_issue_labels(issue_id, labels) when is_list(labels) do
+    send_event({:memory_tracker_remove_labels, issue_id, labels})
+    :ok
+  end
+
+  @spec create_issue_relation(String.t(), String.t(), String.t()) :: :ok | {:error, term()}
+  def create_issue_relation(issue_id, related_issue_id, relation_type) do
+    send_event({:memory_tracker_issue_relation, issue_id, related_issue_id, relation_type})
     :ok
   end
 
